@@ -5361,6 +5361,35 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
+# CloudFormation spells these PascalCase and the CodeBuild API camelCase, and
+# both are generated from the same model — so lowering the first letter is the
+# whole mapping, with exactly one exception. Verified against botocore's
+# codebuild-2016-10-06 model rather than derived by hand.
+_CB_NAME_EXCEPTIONS = {"BuildSpec": "buildspec"}
+
+
+def _cb_api_shape(value):
+    """Reshape a CloudFormation property tree into the CodeBuild API's own shape.
+
+    Storing the CloudFormation shape verbatim left every field invisible: the
+    API serialises camelCase, so `BatchGetProjects` answered `source={}` and
+    `environment.image=None` for a project CloudFormation had just created, and
+    starting a build on it failed having run nothing — SUBMITTED, QUEUED,
+    COMPLETED, no DOWNLOAD_SOURCE, no BUILD. The same project created over the
+    API builds normally, which is what makes this a translation bug rather than
+    a missing feature.
+    """
+    if isinstance(value, list):
+        return [_cb_api_shape(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, item in value.items():
+        name = _CB_NAME_EXCEPTIONS.get(key) or (key[:1].lower() + key[1:] if key else key)
+        out[name] = _cb_api_shape(item)
+    return out
+
+
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
     
@@ -5371,14 +5400,14 @@ def _codebuild_project_create(logical_id, props, stack_name):
     data = {
         "name": name,
         "description": props.get("Description", ""),
-        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "source": _cb_api_shape(props.get("Source")) or {"type": "NO_SOURCE"},
         "sourceVersion": props.get("SourceVersion", ""),
-        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
-        "environment": props.get("Environment", {
+        "artifacts": _cb_api_shape(props.get("Artifacts")) or {"type": "NO_ARTIFACTS"},
+        "environment": _cb_api_shape(props.get("Environment")) or {
             "type": "LINUX_CONTAINER",
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
-        }),
+        },
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
