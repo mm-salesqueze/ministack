@@ -5335,6 +5335,58 @@ def _cognito_user_pool_domain_delete(physical_id, props):
             pool["Domain"] = None
 
 
+def _cognito_user_pool_identity_provider_create(logical_id, props, stack_name):
+    """Provision an AWS::Cognito::UserPoolIdentityProvider onto the store the API already uses.
+
+    Cognito implements identity providers in full — Create/Describe/Update/Delete
+    /List, kept in the pool's own `_identity_providers` map. Only the
+    CloudFormation wiring was missing, so a stack that federates to Google or an
+    OIDC provider could not deploy at all; it rolled back on `Unsupported
+    resource type` and took every other resource in the stack with it. That is a
+    single social login costing the whole application.
+
+    Written against the same map `_create_identity_provider` writes, so a
+    provider created by CloudFormation is indistinguishable from one created over
+    the API — DescribeIdentityProvider and ListIdentityProviders find it, and
+    hosted-UI login flows see it, which is the point of having one.
+    """
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolIdentityProvider")
+
+    provider_name = props.get("ProviderName")
+    if not provider_name:
+        raise ValueError("AWS::Cognito::UserPoolIdentityProvider requires ProviderName")
+    provider_type = props.get("ProviderType")
+    if not provider_type:
+        raise ValueError("AWS::Cognito::UserPoolIdentityProvider requires ProviderType")
+    if provider_type not in _cognito.VALID_PROVIDER_TYPES:
+        raise ValueError(f"Invalid ProviderType: {provider_type}")
+
+    now = _cognito._now_epoch()
+    pool.setdefault("_identity_providers", {})[provider_name] = {
+        "UserPoolId": pid,
+        "ProviderName": provider_name,
+        "ProviderType": provider_type,
+        "ProviderDetails": props.get("ProviderDetails", {}) or {},
+        "AttributeMapping": props.get("AttributeMapping", {}) or {},
+        "IdpIdentifiers": props.get("IdpIdentifiers", []) or [],
+        "CreationDate": now,
+        "LastModifiedDate": now,
+    }
+    # Ref on this resource type returns the ProviderName (matches real AWS —
+    # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolidentityprovider.html#aws-resource-cognito-userpoolidentityprovider-return-values).
+    return provider_name, {}
+
+
+def _cognito_user_pool_identity_provider_delete(physical_id, props):
+    pool = _cognito._user_pools.get(props.get("UserPoolId", ""))
+    if not pool:
+        return
+    pool.get("_identity_providers", {}).pop(physical_id, None)
+
+
 # ===========================================================================
 # --- ECR resource provisioners ---
 
@@ -8792,6 +8844,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::Cognito::UserPoolIdentityProvider": {"create": _cognito_user_pool_identity_provider_create, "delete": _cognito_user_pool_identity_provider_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
     "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
