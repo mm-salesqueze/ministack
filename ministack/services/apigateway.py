@@ -1716,12 +1716,36 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 # ---- Control plane: APIs ----
 
 def find_api_scope(api_id):
-    """Return (account_id, region) owning api_id within the ambient account."""
+    """Return (account_id, region) owning api_id, preferring the ambient account.
+
+    The ambient account comes from the request's SigV4 credentials, and a data
+    plane request does not necessarily have any: an API id is the whole address
+    in every one of the three execute-api forms, and the caller is a browser or
+    an HTTP client, not an SDK. So an API in a non-default account used to be
+    reachable ONLY by signing the request, which is both unlike AWS (where the
+    execute-api hostname identifies the API without credentials) and actively
+    harmful, because the header signing needs is the header applications use:
+    an app doing `Authorization: Bearer <jwt>` cannot also carry SigV4, and its
+    own API answers 404 Not Found.
+
+    Falling back to a global scan removes that. `_api_owner` above already does
+    exactly this for WebSocket dispatch, for the same reason and with the same
+    justification -- an id is unique across the store -- so this is that
+    precedent applied to the path every other protocol takes.
+
+    The ambient-account match is still tried FIRST, so behaviour is unchanged
+    wherever it succeeds; only the case that used to 404 resolves differently.
+    """
     account_id = get_account_id()
+    fallback = None
     for (stored_account, region, stored_api_id), _api in _apis.all_items():
-        if stored_account == account_id and stored_api_id == api_id:
+        if stored_api_id != api_id:
+            continue
+        if stored_account == account_id:
             return stored_account, region
-    return None
+        if fallback is None:
+            fallback = (stored_account, region)
+    return fallback
 
 
 def stages_for_api(api_id):
