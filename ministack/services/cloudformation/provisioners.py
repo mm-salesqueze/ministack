@@ -7202,6 +7202,54 @@ def _apigw_v2_route_delete(physical_id, props):
 
 
 # ---------------------------------------------------------------------------
+# ApiGatewayV2 RouteResponse
+# ---------------------------------------------------------------------------
+
+def _apigw_v2_route_response_create(logical_id, props, stack_name):
+    """Maps CFN properties onto the same store CreateRouteResponse writes to.
+
+    What this fixes is deployment, not delivery. Without it the type is an
+    `Unsupported resource type` and the whole stack rolls back — the CDK emits
+    one per two-way WebSocket route, so an app with three routes cannot deploy
+    at all.
+
+    Measured, so as not to overclaim: this service already returns a two-way
+    route's integration response whether or not a RouteResponse exists. Two
+    otherwise identical APIs, one with and one without, both delivered the
+    handler's return value to the client. On AWS the route response is what
+    makes a two-way route reply, so declaring it is still correct and Terraform
+    and CDK both read it back for drift — but nothing in the data plane here
+    depends on it today.
+
+    `RouteId` arrives as a Ref to the Route, and this file gives a Route the
+    physical id ``{apiId}/{routeId}`` (see `_apigw_v2_route_create`) rather than
+    the bare id the API takes — so it is split back apart here. The same
+    composite shape is used for the response's own physical id, because the
+    delete needs all three parts and the neighbouring provisioners already
+    establish that convention.
+    """
+    api_id = props.get("ApiId", "")
+    route_ref = str(props.get("RouteId", ""))
+    route_id = route_ref.split("/", 1)[1] if "/" in route_ref else route_ref
+    rr_id = new_uuid()[:8]
+    _apigw_v2._route_responses.setdefault(api_id, {}).setdefault(route_id, {})[rr_id] = {
+        "routeResponseId": rr_id,
+        "routeResponseKey": props.get("RouteResponseKey", "$default"),
+        "modelSelectionExpression": props.get("ModelSelectionExpression"),
+        "responseModels": props.get("ResponseModels", {}),
+        "responseParameters": props.get("ResponseParameters", {}),
+    }
+    return f"{api_id}/{route_id}/{rr_id}", {"RouteResponseId": rr_id}
+
+
+def _apigw_v2_route_response_delete(physical_id, props):
+    parts = physical_id.split("/")
+    if len(parts) == 3:
+        api_id, route_id, rr_id = parts
+        _apigw_v2._route_responses.get(api_id, {}).get(route_id, {}).pop(rr_id, None)
+
+
+# ---------------------------------------------------------------------------
 # ApiGatewayV2 Authorizer
 # ---------------------------------------------------------------------------
 
@@ -8850,6 +8898,8 @@ _RESOURCE_HANDLERS = {
     "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
     "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
     "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
+    "AWS::ApiGatewayV2::RouteResponse": {"create": _apigw_v2_route_response_create,
+                                         "delete": _apigw_v2_route_response_delete},
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
