@@ -64,6 +64,31 @@ def _is_custom_resource(resource_type: str) -> bool:
     return resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource"
 
 
+def _may_call_back(resource_type: str) -> bool:
+    """Does creating, updating or deleting this type block on a request to this server?
+
+    A custom resource does: it invokes a Lambda and then waits for that function
+    to PUT to a ResponseURL this same server has to serve. A nested stack does
+    too, one level removed — the nested-stack handlers provision and delete the
+    child's resources inline, and any of them may be a custom resource. CDK puts
+    its log-retention and bucket-deployment handlers inside nested stacks as a
+    matter of course, so this is the common case rather than a corner.
+
+    Every such call must run off the event loop. Blocking it means the callback
+    can never be served, so the wait ends only by timing out — and with
+    ``ServiceTimeout`` defaulting to 3600s, the server answers nothing at all
+    until it does.
+
+    That is five call sites, not two, and the three that are not the obvious
+    create/update pair are the ones worth naming: teardown invokes the same
+    Lambda with RequestType=Delete; an update deletes the resources dropped from
+    the template; and a rollback deletes what the failed run created. The last
+    fires precisely when a deploy has already gone wrong, which is the worst
+    moment to stop answering.
+    """
+    return _is_custom_resource(resource_type) or resource_type == "AWS::CloudFormation::Stack"
+
+
 # ===========================================================================
 # Stack Events helper
 # ===========================================================================
@@ -335,7 +360,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 ) in _RETAINING_POLICIES
                 token = _RETAIN_REPLACED.set(retain_replaced)
                 try:
-                    if _is_custom_resource(resource_type):
+                    if _may_call_back(resource_type):
                         physical_id, attrs = await run_reentrant(
                             _update_resource, resource_type, old_pid, old_props,
                             resolved_props, stack_name, logical_id, old_attrs
@@ -355,7 +380,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     replaced_resources.append(
                         (logical_id, resource_type, old_pid, old_props))
             else:
-                if _is_custom_resource(resource_type):
+                if _may_call_back(resource_type):
                     physical_id, attrs = await run_reentrant(
                         _provision_resource, resource_type, logical_id, resolved_props, stack_name
                     )
@@ -437,7 +462,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 provisioned_resources.pop(logical_id, None)
                 continue
             try:
-                if _is_custom_resource(rtype):
+                if _may_call_back(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, pid, old_props,
                         stack_name, logical_id
@@ -524,7 +549,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                     provisioned_resources.pop(logical_id, None)
                     continue
                 try:
-                    if _is_custom_resource(rtype):
+                    if _may_call_back(rtype):
                         await run_reentrant(
                             _delete_resource, rtype, pid, res_props,
                             stack_name, logical_id
@@ -650,7 +675,7 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
-            if _is_custom_resource(rtype):
+            if _may_call_back(rtype):
                 await run_reentrant(
                     _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id
