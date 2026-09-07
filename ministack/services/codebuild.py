@@ -373,6 +373,87 @@ def _timeout_seconds(project):
     return max(1, minutes) * 60
 
 
+def _populate_source_dir(source_dir: str, project: dict, build_id: str) -> None:
+    """Put the project's SOURCE in the directory the build runs against.
+
+    Only the buildspec was ever written here, so a build ran against an
+    otherwise EMPTY directory whatever the project's `source` said. For a
+    project whose buildspec is self-contained that is invisible; for a real CI
+    project it is fatal in a confusing way, because the buildspec is present and
+    correct and every command in it fails on a file that is not there:
+
+        ./ci/ci-build.sh: No such file or directory
+
+    which reads as a broken repository rather than as source that was never
+    fetched.
+
+    S3 is implemented because it is the source type a local caller can actually
+    populate; a zip in a bucket is exactly what `StartBuild` with
+    `sourceTypeOverride=S3` expects. Git-backed types (GITHUB, BITBUCKET,
+    CODECOMMIT) still do nothing, deliberately: cloning would need credentials
+    and network, and silently substituting an empty tree for them is the bug
+    this fixes. They are logged so the reason is visible.
+    """
+    src = project.get("source") or {}
+    src_type = (src.get("type") or "NO_SOURCE").upper()
+
+    if src_type in ("NO_SOURCE", ""):
+        return
+
+    if src_type != "S3":
+        logger.warning(
+            "Build %s: source type %s is not fetched; the build runs against an "
+            "empty source directory. Use sourceTypeOverride=S3 with a zip to "
+            "supply the tree.", build_id, src_type)
+        return
+
+    import io
+    import zipfile
+
+    location = (src.get("location") or "").strip()
+    if location.startswith("s3://"):
+        location = location[len("s3://"):]
+    bucket_name, _, key = location.partition("/")
+    if not bucket_name or not key:
+        logger.error("Build %s: S3 source location %r is not <bucket>/<key>", build_id, location)
+        return
+
+    from ministack.services import s3 as s3_svc
+
+    bucket = s3_svc._buckets.get(bucket_name)
+    obj = (bucket or {}).get("objects", {}).get(key)
+    if obj is None:
+        logger.error("Build %s: S3 source s3://%s/%s not found", build_id, bucket_name, key)
+        return
+
+    # `_read_body`, not `obj["body"]`: with S3_PERSIST the body is spilled to
+    # disk and the in-memory field is left as None, so reading the record
+    # directly yields nothing and the archive looks corrupt rather than absent.
+    body = s3_svc._read_body(bucket_name, key, obj) or b""
+    try:
+        with zipfile.ZipFile(io.BytesIO(body)) as zf:
+            zf.extractall(source_dir)
+            # `extractall` does NOT restore the Unix mode; everything lands 0644.
+            # Real CodeBuild preserves it, and a CI buildspec runs the repo's own
+            # scripts -- so without this every `./ci/whatever.sh` fails with exit
+            # status 126, "found but not executable", which reads as a broken
+            # script rather than a lost permission bit.
+            for info in zf.infolist():
+                mode = info.external_attr >> 16
+                if not mode:
+                    continue
+                target = os.path.join(source_dir, info.filename)
+                if os.path.exists(target) and not info.is_dir():
+                    os.chmod(target, mode & 0o7777)
+    except zipfile.BadZipFile:
+        logger.error("Build %s: S3 source s3://%s/%s is not a zip archive",
+                     build_id, bucket_name, key)
+        return
+
+    logger.info("Build %s: unpacked %d bytes of source from s3://%s/%s",
+                build_id, len(body), bucket_name, key)
+
+
 def _execute_build(build_id, project):
     """Run a build through the CodeBuild local agent; update its record live."""
     build = _builds.get(build_id)
@@ -392,6 +473,8 @@ def _execute_build(build_id, project):
     try:
         for path in (source_dir, artifacts_dir, env_dir):
             os.makedirs(path, exist_ok=True)
+
+        _populate_source_dir(source_dir, project, build_id)
 
         buildspec = (project.get("source") or {}).get("buildspec") or ""
         if not buildspec.strip():
