@@ -972,6 +972,25 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "ecr":
         name = _safe_json_field(body, "repositoryName")
+        if not name:
+            # DescribeRepositories takes `repositoryNames` — a LIST — and every
+            # other ECR call takes the singular. Reading only the singular made
+            # this resolve to "*", which matches no repository-scoped policy, so
+            # the call was denied against a policy that plainly allows it.
+            #
+            # That is not a corner: it is exactly what CDK's bootstrap grants its
+            # image-publishing role (ecr:DescribeRepositories on the container
+            # assets repository ARN), so under AUTH=true every CDK app with a
+            # Docker image asset failed to publish with "no identity-based policy
+            # allows the ecr:DescribeRepositories action".
+            #
+            # One resource is evaluated per request, so the first name is used.
+            # The publisher asks about one repository; a caller asking about
+            # several gets the first checked, which is stricter than "*" and
+            # closer than nothing.
+            names = _safe_json_field(body, "repositoryNames")
+            if isinstance(names, list) and names:
+                name = names[0]
         if name:
             return f"arn:aws:ecr:{region}:{account_id}:repository/{name}"
         return "*"
