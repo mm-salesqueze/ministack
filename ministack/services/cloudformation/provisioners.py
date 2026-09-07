@@ -5672,6 +5672,36 @@ def _ec2_flow_log_create(logical_id, props, stack_name):
 
 def _ec2_flow_log_delete(physical_id, props):
     _ec2._flow_logs.pop(physical_id, None)
+def _ecs_cluster_capacity_providers_create(logical_id, props, stack_name):
+    """Associate capacity providers with a cluster, as PutClusterCapacityProviders does.
+
+    The ECS service already implements that call and it only sets two fields on
+    the cluster record; the CloudFormation type had no provisioner, so a stack
+    declaring Fargate capacity providers rolled back. CDK emits one of these
+    automatically for `ecs.Cluster({ enableFargateCapacityProviders: true })`.
+
+    The strategy list is PascalCase in CloudFormation and camelCase on the API,
+    so it is translated here rather than stored as-is — a strategy the service's
+    own API cannot read is the defect this would otherwise reproduce.
+    """
+    cluster = props.get("Cluster", "")
+    record = _ecs._clusters.get(cluster)
+    if record is None:
+        raise ValueError("AWS::ECS::ClusterCapacityProviderAssociations: "
+                         f"cluster {cluster!r} not found")
+    record["capacityProviders"] = props.get("CapacityProviders", []) or []
+    record["defaultCapacityProviderStrategy"] = [
+        {k[:1].lower() + k[1:]: v for k, v in item.items()}
+        for item in (props.get("DefaultCapacityProviderStrategy") or [])
+    ]
+    return cluster, {}
+
+
+def _ecs_cluster_capacity_providers_delete(physical_id, props):
+    record = _ecs._clusters.get(physical_id)
+    if record is not None:
+        record["capacityProviders"] = []
+        record["defaultCapacityProviderStrategy"] = []
 
 
 def _ec2_igw_create(logical_id, props, stack_name):
@@ -8776,6 +8806,9 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
     "AWS::EC2::FlowLog": {"create": _ec2_flow_log_create, "delete": _ec2_flow_log_delete},
+    "AWS::ECS::ClusterCapacityProviderAssociations": {
+        "create": _ecs_cluster_capacity_providers_create,
+        "delete": _ecs_cluster_capacity_providers_delete},
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
     "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
     "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
