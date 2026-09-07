@@ -399,7 +399,26 @@ def _lambda_action(method: str, path: str) -> str | None:
         "event-source-mappings": "ListEventSourceMappings",
         "concurrency": "PutFunctionConcurrency",
         "code-signing-config": "GetFunctionCodeSigningConfig",
-        "url": "GetFunctionUrlConfig" if method == "GET" else "CreateFunctionUrlConfig",
+        # /url and /urls are DIFFERENT operations, and the plural one was
+        # falling through to the catch-all below and being charged as
+        # lambda:GetFunction. Per botocore's own model
+        # (lambda/2015-03-31/service-2.json):
+        #
+        #   GetFunctionUrlConfig     GET    .../functions/{name}/url
+        #   UpdateFunctionUrlConfig  PUT    .../functions/{name}/url
+        #   DeleteFunctionUrlConfig  DELETE .../functions/{name}/url
+        #   ListFunctionUrlConfigs   GET    .../functions/{name}/urls
+        #
+        # Charging the wrong action denies a request against a policy that
+        # plainly allows it: a role granted lambda:ListFunctionUrlConfigs and
+        # nothing else is told it "is not authorized to perform:
+        # lambda:GetFunction", naming an action the caller never invoked, which
+        # sends you looking at the policy rather than at the mapping.
+        "url": ("GetFunctionUrlConfig" if method == "GET"
+                else "DeleteFunctionUrlConfig" if method == "DELETE"
+                else "UpdateFunctionUrlConfig" if method == "PUT"
+                else "CreateFunctionUrlConfig"),
+        "urls": "ListFunctionUrlConfigs",
         "tags": "TagResource" if method == "POST" else "UntagResource" if method == "DELETE" else "ListTags",
     }
     if sub in sub_map:
