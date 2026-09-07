@@ -149,6 +149,25 @@ _CF_LIST_ITEM_TAGS = {
     # half wrong drops every custom and removed header silently.
     "CustomHeadersConfig": "ResponseHeadersPolicyCustomHeader",
     "RemoveHeadersConfig": "ResponseHeadersPolicyRemoveHeader",
+    # DistributionConfig's own lists.
+    "Aliases": "CNAME",
+    "Origins": "Origin",
+    "OriginGroups": "OriginGroup",
+    "CacheBehaviors": "CacheBehavior",
+    "CustomErrorResponses": "CustomErrorResponse",
+    # Keyed on the XML name, not the CloudFormation one: OriginCustomHeaders is renamed to
+    # CustomHeaders before the tag is looked up, and missing this entry emits <Name> children that
+    # a REST-XML SDK parses as Quantity 2 with an EMPTY Items list — the header silently absent
+    # rather than malformed.
+    "CustomHeaders": "OriginCustomHeader",
+    "AllowedMethods": "Method",
+    "CachedMethods": "Method",
+    "FunctionAssociations": "FunctionAssociation",
+    "LambdaFunctionAssociations": "LambdaFunctionAssociation",
+    "OriginSslProtocols": "SslProtocol",
+    "StatusCodes": "StatusCode",
+    "TrustedKeyGroups": "KeyGroup",
+    "TrustedSigners": "AwsAccountNumber",
 }
 
 
@@ -166,10 +185,17 @@ def _cf_props_to_element(tag, value):
             # (`AccessControlAllowHeaders: {Items: [..]}`); XML wants both as a
             # counted Items block.
             listed = None
+            siblings = {}
             if isinstance(item, list):
                 listed = item
-            elif isinstance(item, dict) and set(item) <= {"Items", "Quantity"} and isinstance(item.get("Items"), list):
+            elif isinstance(item, dict) and isinstance(item.get("Items"), list):
                 listed = item["Items"]
+                # A counted block may carry members beside its list —
+                # `AllowedMethods` holds `CachedMethods`, which is the one place
+                # CloudFormation's shape and the XML's genuinely differ in
+                # nesting rather than in naming.
+                siblings = {k: v for k, v in item.items()
+                            if k not in ("Items", "Quantity")}
 
             if listed is not None:
                 block = SubElement(parent, key)
@@ -183,6 +209,8 @@ def _cf_props_to_element(tag, value):
                             fill(child, entry)
                         else:
                             child.text = str(entry)
+                if siblings:
+                    fill(block, siblings)
             elif isinstance(item, dict):
                 fill(SubElement(parent, key), item)
             elif isinstance(item, bool):
@@ -7396,13 +7424,75 @@ def _cf_oai_delete(physical_id, props):
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
+# CloudFormation property name -> the element name CloudFront's XML uses. Both
+# come from the same AWS model, so the whole list is these two.
+_CF_DIST_RENAMES = {
+    "OriginCustomHeaders": "CustomHeaders",
+    "OriginSSLProtocols": "OriginSslProtocols",
+}
+
+
+def _cf_normalise_distribution_props(value):
+    """Reshape a DistributionConfig property tree into the XML's own shape.
+
+    Only where the two genuinely differ, which is in three places:
+
+    - ``CachedMethods`` is a sibling of ``AllowedMethods`` in CloudFormation and
+      a child of it in the XML. This is the only structural difference; the rest
+      of the tree maps one to one.
+    - ``OriginCustomHeaders`` is ``CustomHeaders`` in the XML.
+    - ``OriginSSLProtocols`` differs only in case, which XML does not forgive.
+    """
+    if isinstance(value, list):
+        return [_cf_normalise_distribution_props(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    out = {_CF_DIST_RENAMES.get(key, key): _cf_normalise_distribution_props(item)
+           for key, item in value.items()}
+
+    cached = out.pop("CachedMethods", None)
+    if cached is None:
+        return out
+    allowed = out.get("AllowedMethods")
+    if allowed is None:
+        # CachedMethods without AllowedMethods is not valid on AWS either; keep
+        # it where it was rather than inventing a parent for it.
+        out["CachedMethods"] = cached
+        return out
+    allowed = {"Items": allowed} if isinstance(allowed, list) else dict(allowed)
+    allowed["CachedMethods"] = cached
+    out["AllowedMethods"] = allowed
+    return out
+
+
 def _cf_distribution_create(logical_id, props, stack_name):
+    """Provision an AWS::CloudFront::Distribution.
+
+    ``config_xml`` is where a distribution's configuration lives: for one created
+    over the API it is the client's own request body, and every read path
+    re-parses it. Storing an empty string here left a CloudFormation-provisioned
+    distribution with no origins, no cache behaviours and no function
+    associations — readable as a record, useless as a distribution — so the
+    properties are rendered into the same XML the API path would have stored.
+    """
+    from xml.etree.ElementTree import tostring
+
     dist_config = props.get("DistributionConfig", props)
     dist_id = _cf._dist_id()
     arn = f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}"
 
-    origins = dist_config.get("Origins", [])
-    default_cache = dist_config.get("DefaultCacheBehavior", {})
+    config_props = _cf_normalise_distribution_props(dist_config)
+    # Multi-tenant distributions are a separate surface (_distribution_tenants,
+    # _connection_groups); emitting the block without that pairing would only
+    # produce XML nothing reads.
+    config_props.pop("TenantConfig", None)
+    # Required by the XML and absent from the CloudFormation properties, because
+    # CloudFormation's own resource identity plays the same role.
+    config_props.setdefault("CallerReference", dist_id)
+
+    config_el = _cf_props_to_element("DistributionConfig", config_props)
+    config_el.set("xmlns", _cf.NS)
 
     _cf._distributions[dist_id] = {
         "Id": dist_id,
@@ -7411,7 +7501,7 @@ def _cf_distribution_create(logical_id, props, stack_name):
         "DomainName": f"{dist_id}.cloudfront.net",
         "LastModifiedTime": now_iso(),
         "ETag": new_uuid(),
-        "config_xml": "",
+        "config_xml": tostring(config_el, encoding="unicode"),
         "enabled": dist_config.get("Enabled", True),
     }
     _cf._invalidations[dist_id] = []
