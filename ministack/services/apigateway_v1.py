@@ -871,12 +871,39 @@ def _restore_child_store(store, restored, parent_regions, parent_name_from_key=l
 
 
 def find_api_scope(api_id):
-    """Return (account_id, region) owning api_id within the ambient account."""
+    """Return (account_id, region) owning api_id, preferring the ambient account.
+
+    The v1 half of the same fix as `apigateway.find_api_scope`, and the half
+    that matters most in practice, because REST is what a CDK app deploys.
+
+    The ambient account comes from the request's SigV4 credentials, and a data
+    plane request does not necessarily have any: the api id is the whole address
+    in every one of the three execute-api forms, and the caller is a browser or
+    an application HTTP client, not an SDK. So a REST API in a non-default
+    account used to be reachable ONLY by signing the request, which is both
+    unlike AWS -- where the execute-api hostname identifies the API without any
+    credentials -- and actively harmful, because the header that signing needs
+    is the header applications use. An app authenticating with
+    `Authorization: Bearer <jwt>` cannot also carry SigV4, so its own API
+    answers 404 Not Found and nothing says why.
+
+    `apigateway._api_owner` already scans every account for WebSocket dispatch,
+    for the same reason and with the same justification: an api id is unique
+    across the store. This is that precedent applied to REST.
+
+    The ambient-account match is still tried FIRST, so behaviour is unchanged
+    wherever it already succeeded; only the case that used to 404 resolves.
+    """
     account_id = get_account_id()
+    fallback = None
     for (stored_account, region, stored_api_id), _api in _rest_apis.all_items():
-        if stored_account == account_id and stored_api_id == api_id:
+        if stored_api_id != api_id:
+            continue
+        if stored_account == account_id:
             return stored_account, region
-    return None
+        if fallback is None:
+            fallback = (stored_account, region)
+    return fallback
 
 
 def find_domain_scope(domain_name):
