@@ -2514,7 +2514,6 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
                           WebSocket routes, so this also covers the
                           never-valid HTTP_PROXY case.
     """
-    from ministack.core.lambda_runtime import get_or_create_worker
     from ministack.services import lambda_svc
 
     raw_target = route.get("target", "").replace("integrations/", "")
@@ -2614,28 +2613,22 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
     runtime = func_config.get("Runtime", "")
     code_zip = func_data.get("code_zip")
     if code_zip and runtime.startswith(("python", "nodejs")):
-        # get_or_create_worker keys internally as f"{func_name}:{qualifier}",
-        # so we must pass name + qualifier separately. Building a synthetic
-        # `f"{func_name}:{qualifier}"` and passing it as func_name double-
-        # suffixes the key (`fn:qual:$LATEST`), missing the warm pool the
-        # SDK invoke path populates and forcing a cold start on every WS
-        # message. That's why pre-warming the function via the SDK didn't
-        # help WebSocket dispatch — keys didn't match.
-        def _invoke_worker():
-            worker = get_or_create_worker(
-                func_name, func_config, code_zip,
-                qualifier=qualifier or "$LATEST",
-            )
-            return worker.invoke(event, message_id)
-
+        # Route through the central _execute_function dispatcher, exactly as the
+        # HTTP path above does. Calling get_or_create_worker here instead pinned
+        # every WebSocket route to the in-process subprocess worker whatever
+        # LAMBDA_EXECUTOR said — and that worker runs inside ministack's own
+        # container, which carries no AWS SDK. So a handler doing the ordinary
+        # thing died on `Cannot find module '@aws-sdk/lib-dynamodb'` at init,
+        # while the same function invoked over the SDK ran fine in the official
+        # image. The failure surfaces as a socket that will not open, because it
+        # is $connect that fails first.
+        exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
         result = await run_reentrant(
-            lambda_svc._run_with_function_config_scope,
-            func_config,
-            _invoke_worker,
+            lambda_svc._execute_function_with_config_scope, exec_record, event,
+            thread_name="ministack-apigw-ws-invoke",
         )
-        if result.get("status") == "error":
-            return {"statusCode": 500, "body": result.get("error", "")}
-        return result.get("result", {})
+        lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
+        return lambda_response
     # Image/unsupported runtime stub — success without body.
     return {"statusCode": 200, "body": ""}
 
