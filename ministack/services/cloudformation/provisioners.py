@@ -5827,6 +5827,38 @@ def _ec2_sg_delete(physical_id, props):
     _ec2._security_groups.pop(physical_id, None)
 
 
+def _ec2_flow_log_create(logical_id, props, stack_name):
+    """Provision an AWS::EC2::FlowLog onto the store CreateFlowLogs already writes.
+
+    The EC2 service implements flow logs in full — Create/Describe/Delete, with
+    the records persisted and cleared by reset. Only the CloudFormation wiring
+    was missing, so a VPC that turns logging on could not deploy at all: the
+    stack rolled back on `Unsupported resource type`. A CDK app gets one for
+    free from `ec2.Vpc({ flowLogs })`, which is why the environments with a real
+    network hit it and the ones without do not.
+    """
+    import random
+    import string
+    fl_id = "fl-" + "".join(random.choices(string.hexdigits[:16], k=17))
+    _ec2._flow_logs[fl_id] = {
+        "FlowLogId": fl_id,
+        "ResourceId": props.get("ResourceId", ""),
+        "ResourceType": props.get("ResourceType", "VPC"),
+        "TrafficType": props.get("TrafficType", "ALL"),
+        "LogDestinationType": props.get("LogDestinationType", "cloud-watch-logs"),
+        "LogDestination": props.get("LogDestination") or props.get("LogGroupName", ""),
+        "DeliverLogsPermissionArn": props.get("DeliverLogsPermissionArn", ""),
+        "MaxAggregationInterval": int(props.get("MaxAggregationInterval", 600)),
+        "FlowLogStatus": "ACTIVE",
+        "CreationTime": now_iso(),
+    }
+    return fl_id, {"Id": fl_id}
+
+
+def _ec2_flow_log_delete(physical_id, props):
+    _ec2._flow_logs.pop(physical_id, None)
+
+
 def _ec2_igw_create(logical_id, props, stack_name):
     import random
     import string
@@ -8823,6 +8855,7 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::Subnet": {"create": _ec2_subnet_create, "delete": _ec2_subnet_delete},
     "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
+    "AWS::EC2::FlowLog": {"create": _ec2_flow_log_create, "delete": _ec2_flow_log_delete},
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
     "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
     "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
