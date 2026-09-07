@@ -364,6 +364,41 @@ def test_start_build_is_metadata_only_by_default(monkeypatch):
     assert calls == []
 
 
+def test_execute_build_removes_its_workspace(monkeypatch, tmp_path):
+    """The workspace is reaped once the build ends, unless asked to keep it.
+
+    A workspace holds the whole unpacked source plus its output, and WORKSPACE
+    defaults under /tmp -- a tmpfs on many Linux installs. Left behind, a handful
+    of builds of a real repo fill it and the next one dies on "No space left on
+    device" with gigabytes free on the actual disk.
+    """
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("CODEBUILD_KEEP_WORKSPACE", raising=False)
+
+    project = _execution_project()
+    _seed_execution_build(project)
+    codebuild._execute_build("demo:0001", project)
+
+    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001"))
+
+
+def test_execute_build_keeps_its_workspace_when_asked(monkeypatch, tmp_path):
+    container = _FakeContainer(["Phase complete: BUILD State: SUCCEEDED"])
+    docker = _FakeDocker(container)
+    monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("CODEBUILD_KEEP_WORKSPACE", "1")
+
+    project = _execution_project()
+    _seed_execution_build(project)
+    codebuild._execute_build("demo:0001", project)
+
+    assert os.path.isdir(os.path.join(str(tmp_path), "demo_0001"))
+
+
 def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
     container = _FakeContainer([
         "Phase complete: INSTALL State: SUCCEEDED",
@@ -373,6 +408,10 @@ def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
     docker = _FakeDocker(container)
     monkeypatch.setattr(codebuild, "_get_docker", lambda: docker)
     monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    # The workspace is reaped when the build finishes, so the buildspec and env
+    # file this test reads afterwards would already be gone. Keep them for these
+    # assertions; the reaping itself is covered by its own test below.
+    monkeypatch.setenv("CODEBUILD_KEEP_WORKSPACE", "1")
 
     project = _execution_project()
     build = _seed_execution_build(project)
