@@ -2162,7 +2162,6 @@ def test_apigw_integration_content_handling_strategy_roundtrip(apigw):
 def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
     import asyncio
 
-    from ministack.core import lambda_runtime
     from ministack.core.responses import get_region, set_request_region
     from ministack.services import apigateway as apigw_mod
     from ministack.services import lambda_svc
@@ -2179,21 +2178,21 @@ def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
     func_record = {"config": func_config, "code_zip": b"fake-zip"}
     seen_regions = []
 
-    def fake_get_func_record_for_ref(function_ref):
+    def fake_get_func_record_for_ref_in_scope(function_ref, *, account_id=None, region=None):
         assert function_ref == func_arn
+        seen_regions.append(("resolve", get_region()))
         return func_record, func_config, func_name
 
-    class FakeWorker:
-        def invoke(self, event, message_id):
-            seen_regions.append(("invoke", get_region()))
-            return {"status": "ok", "result": {"statusCode": 200, "body": "ok"}}
+    def fake_execute(func, event):
+        seen_regions.append(("invoke", get_region()))
+        # _execute_function's shape: the handler's return value under "body".
+        return {"body": {"statusCode": 200, "body": "ok"}}
 
-    def fake_get_or_create_worker(name, config, code_zip, *, qualifier):
-        seen_regions.append(("spawn", get_region(), name, qualifier))
-        return FakeWorker()
-
-    monkeypatch.setattr(lambda_svc, "_get_func_record_for_ref", fake_get_func_record_for_ref)
-    monkeypatch.setattr(lambda_runtime, "get_or_create_worker", fake_get_or_create_worker)
+    monkeypatch.setattr(lambda_svc, "_get_func_record_for_ref_in_scope",
+                        fake_get_func_record_for_ref_in_scope)
+    # The INNER function, so _execute_function_with_config_scope still wraps it in
+    # the function's own account/region scope -- which is exactly what is asserted.
+    monkeypatch.setattr(lambda_svc, "_execute_function", fake_execute)
 
     apigw_mod._integrations[api_id] = {
         integration_id: {"integrationType": "AWS_PROXY", "integrationUri": func_arn}
@@ -2220,10 +2219,10 @@ def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
         set_request_region("us-east-1")
 
     assert result == {"statusCode": 200, "body": "ok"}
-    assert seen_regions == [
-        ("spawn", "us-west-2", func_name, "$LATEST"),
-        ("invoke", "us-west-2"),
-    ]
+    # The invocation runs in the FUNCTION's region, not the request's, whichever
+    # executor ends up serving it -- that is what this test is here to pin.
+    assert ("invoke", "us-west-2") in seen_regions
+    assert get_region() == "us-east-1"
 
 
 def test_apigw_delete_route_v2(apigw):
