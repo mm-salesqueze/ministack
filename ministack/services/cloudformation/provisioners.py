@@ -1294,8 +1294,9 @@ def _ddb_global_table_create(logical_id, props, stack_name):
       * No `ProvisionedThroughput` — capacity comes from
         `WriteProvisionedThroughputSettings` and `ReadProvisionedThroughputSettings`,
         each wrapping a `<Read|Write>CapacityAutoScalingSettings.MinCapacity`.
-      * `Replicas` is required (one entry per region). Cross-region replication
-        has no meaning here, so we accept the field and ignore its contents.
+      * `Replicas` is required (one entry per region). Each one is registered
+        as the SAME table object, so the replicas share their items -- see
+        below.
       * Multi-region settings (`MultiRegionConsistency`, `GlobalTableWitnesses`,
         `GlobalTableSourceArn`, `WarmThroughput`) are accepted and ignored.
 
@@ -1324,10 +1325,48 @@ def _ddb_global_table_create(logical_id, props, stack_name):
     translated.pop("WriteProvisionedThroughputSettings", None)
     translated.pop("ReadProvisionedThroughputSettings", None)
 
-    return _ddb_create(logical_id, translated, stack_name)
+    name, attrs = _ddb_create(logical_id, translated, stack_name)
+
+    # Put the SAME table object in every declared replica region.
+    #
+    # Ignoring `Replicas` left the table existing in exactly one region, and an
+    # application that reads it from another -- which is the entire point of
+    # declaring a global table -- got
+    #
+    #   ResourceNotFoundException: Requested resource not found
+    #
+    # naming a missing TABLE, from a region it never mentions. A CloudFront
+    # Lambda@Edge is the case that finds this: it runs wherever the viewer is
+    # and reads the tenant registry from its own region, so the same request
+    # succeeds from one edge location and 502s from another.
+    #
+    # `items` lives INSIDE the table object (see `_ddb_create`), so registering
+    # one object under several region keys means a write through any replica is
+    # visible through all of them. That is what a global table IS, so this
+    # models it rather than stubbing it -- the thing that genuinely has no
+    # meaning in one process is replication LAG, not replication.
+    #
+    # Only the table itself is shared. Tags, TTL and PITR settings stay
+    # per-region, which is where the emulator's fidelity ends.
+    table = _dynamodb._tables.get(name)
+    if table is not None:
+        account = get_account_id()
+        for replica in (props.get("Replicas") or []):
+            region = replica.get("Region") if isinstance(replica, dict) else None
+            if region:
+                _dynamodb._tables.set_scoped(account, region, name, table)
+
+    return name, attrs
 
 
 def _ddb_global_table_delete(physical_id, props):
+    # Every region the create registered, or a replica outlives the stack that
+    # declared it and the next deploy finds a table it did not create.
+    account = get_account_id()
+    for replica in (props.get("Replicas") or []):
+        region = replica.get("Region") if isinstance(replica, dict) else None
+        if region:
+            _dynamodb._tables.pop_scoped(account, region, physical_id, None)
     _ddb_delete(physical_id, props)
 
 
