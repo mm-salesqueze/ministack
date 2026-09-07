@@ -194,7 +194,12 @@ AGENT_IMAGE = "public.ecr.aws/codebuild/local-builds:latest"
 
 # Internal scratch space for the source/artifacts/env files handed to the
 # agent container; not an AWS concept, so not configurable.
-WORKSPACE = "/tmp/ministack-codebuild"
+# `/tmp` is a tmpfs on many Linux installs -- commonly a few GiB -- and a build
+# workspace holds the whole unpacked source plus its output, so a handful of
+# builds of a real repo fill it and the next one dies on
+# "zip I/O error: No space left on device" with gigabytes free on the actual
+# disk. Overridable so it can be pointed at disk.
+WORKSPACE = os.environ.get("CODEBUILD_WORKSPACE_DIR", "/tmp/ministack-codebuild")
 
 # Extra `docker run` flags for the AGENT container, with the same syntax and the
 # same parser as LAMBDA_DOCKER_FLAGS.
@@ -611,6 +616,17 @@ def _execute_build(build_id, project):
             container.remove(force=True, v=True)
         except Exception:
             pass
+        # And the workspace, which nothing else ever removed: one per build,
+        # each holding the unpacked source, kept until the process was thrown
+        # away. AWS leaves nothing on the host after a build either -- the
+        # artifacts are uploaded, not left in place. Set
+        # CODEBUILD_KEEP_WORKSPACE=1 to keep them for debugging.
+        if os.environ.get("CODEBUILD_KEEP_WORKSPACE", "") != "1":
+            import shutil
+            try:
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception:
+                logger.warning("Could not remove build workspace %s", workdir)
 
 
 # ---------------------------------------------------------------------------
