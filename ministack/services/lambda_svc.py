@@ -1120,15 +1120,61 @@ def _normalize_endpoint_url(value: str) -> str:
     return f"http://{host}"
 
 
+_self_container_host: str | None = None
+
+
+def _container_reachable_self_host() -> str:
+    """The address a spawned Lambda container can reach this server on.
+
+    ``host.docker.internal`` is the right answer only when ministack runs on the
+    host: it resolves to the Docker bridge gateway, which reaches a published
+    port. When ministack is itself containerised on a user-defined network that
+    breaks twice over — the gateway is not this server, and a port published to
+    loopback (``-p 127.0.0.1:4566:4566``, the safe default) is not on the
+    gateway either. The Lambda then dies on every SDK call with
+    ``ECONNREFUSED 172.17.0.1``.
+
+    Our own address on the network the Lambda containers join is reachable by
+    construction. It is discovered the way ``rds.py`` and ``ecs.py`` discover
+    theirs — by inspecting our own container via ``$HOSTNAME``.
+    """
+    global _self_container_host
+    if _self_container_host is not None:
+        return _self_container_host
+    _self_container_host = "host.docker.internal"
+    if not _running_in_container():
+        return _self_container_host
+    try:
+        client = _get_docker_client()
+        if client is None:
+            return _self_container_host
+        me = client.containers.get(os.environ.get("HOSTNAME", ""))
+        networks = me.attrs["NetworkSettings"]["Networks"]
+        preferred = LAMBDA_DOCKER_NETWORK or os.environ.get("DOCKER_NETWORK") or ""
+        ordered = ([networks[preferred]] if preferred in networks else [])
+        ordered += [cfg for name, cfg in networks.items() if name != preferred]
+        for cfg in ordered:
+            ip = (cfg or {}).get("IPAddress")
+            if ip:
+                _self_container_host = ip
+                logger.debug("Lambda containers will reach ministack at %s", ip)
+                break
+    except Exception:
+        logger.debug("Could not detect this container's address; Lambda "
+                     "containers will use host.docker.internal")
+    return _self_container_host
+
+
 def _rewrite_host_for_container(url: str) -> str:
-    """Rewrite a ``localhost``/``127.0.0.1`` URL to ``host.docker.internal`` so a
-    Docker Lambda container can reach ministack on the host. Explicitly
-    configured hosts (e.g. a Docker-network name) are left untouched."""
+    """Rewrite a ``localhost``/``127.0.0.1`` URL to an address a Docker Lambda
+    container can reach ministack on. Explicitly configured hosts (e.g. a
+    Docker-network name) are left untouched."""
     if not url:
         return url
+    target = _container_reachable_self_host()
     for host in ("localhost", "127.0.0.1"):
-        url = url.replace(f"://{host}:", "://host.docker.internal:")
-        url = url.replace(f"://{host}/", "://host.docker.internal/")
+        url = url.replace(f"://{host}:", f"://{target}:")
+        url = url.replace(f"://{host}/", f"://{target}/")
     return url
 
 
@@ -4257,8 +4303,9 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             config.get("FunctionName", "?"),
         )
     # AWS_ENDPOINT_URL set *after* function env so it always points at ministack.
-    # Replace localhost/127.0.0.1 with host.docker.internal so the container
-    # can reach the host where ministack is running.
+    # Both branches resolve to an address the container can actually reach —
+    # the host gateway when ministack runs on the host, our own address on the
+    # Lambda network when ministack is itself containerised.
     endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
@@ -4266,9 +4313,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
     if not endpoint:
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        endpoint = f"http://host.docker.internal:{port}"
+        endpoint = f"http://{_container_reachable_self_host()}:{port}"
     else:
-        # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
