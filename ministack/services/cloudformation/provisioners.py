@@ -3614,6 +3614,41 @@ def _apigw_method_create(logical_id, props, stack_name):
         }
         _apigw_v1._put_integration(api_id, resource_id, http_method, int_data)
 
+        # PutIntegration does not carry responses on AWS either — they are a
+        # separate call per status code — so they are written the same way a
+        # client writes them rather than by widening the integration helper.
+        #
+        # Dropping these is what made every CDK-generated CORS preflight answer
+        # 200 with NO headers: `defaultCorsPreflightOptions` emits a MOCK
+        # OPTIONS method whose Access-Control-* values live only in
+        # IntegrationResponses[].ResponseParameters. The MOCK executor already
+        # applies them (`apigateway_v1._invoke_mock_v1` maps
+        # method.response.header.* onto real headers and strips the quotes), so
+        # nothing else was missing — and a browser SPA calling its own API
+        # Gateway failed preflight with nothing in the response to say why.
+        #
+        # Worth knowing on upgrade: a CFN-created MOCK method now answers with
+        # its DECLARED status code instead of a hard-coded 200, so a template
+        # declaring 201 or 204 changes its data-plane status. That is the fix,
+        # but it is a visible change for anyone who was relying on the constant.
+        for ir in (integration.get("IntegrationResponses") or []):
+            code = str(ir.get("StatusCode", "200"))
+            _apigw_v1._put_integration_response(api_id, resource_id, http_method, code, {
+                "selectionPattern": ir.get("SelectionPattern", "") or "",
+                "responseParameters": ir.get("ResponseParameters", {}) or {},
+                "responseTemplates": ir.get("ResponseTemplates", {}) or {},
+                "contentHandling": ir.get("ContentHandling"),
+            })
+
+    # Declared beside the integration's, and what real AWS requires present for
+    # the headers above to be returned at all.
+    for mr in (props.get("MethodResponses") or []):
+        code = str(mr.get("StatusCode", "200"))
+        _apigw_v1._put_method_response(api_id, resource_id, http_method, code, {
+            "responseParameters": mr.get("ResponseParameters", {}) or {},
+            "responseModels": mr.get("ResponseModels", {}) or {},
+        })
+
     pid = f"{api_id}-{resource_id}-{http_method}"
     return pid, {}
 
