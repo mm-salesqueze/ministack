@@ -382,7 +382,42 @@ def test_execute_build_removes_its_workspace(monkeypatch, tmp_path):
     _seed_execution_build(project)
     codebuild._execute_build("demo:0001", project)
 
-    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001"))
+    # src/ and env/ go; artifacts/ stays, because nothing here uploads it and
+    # the workspace is therefore the only copy of the build output.
+    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001", "src"))
+    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001", "env"))
+    assert os.path.isdir(os.path.join(str(tmp_path), "demo_0001", "artifacts"))
+
+
+def test_reap_workspace_refuses_a_target_outside_the_root(monkeypatch, tmp_path):
+    """A project name containing `..` must not aim rmtree outside WORKSPACE.
+
+    CreateProject only checks the name is non-empty, where AWS enforces
+    [A-Za-z0-9][A-Za-z0-9\\-_]{1,254}, so the workdir is built from a string the
+    caller controls.
+    """
+    root = tmp_path / "ws"
+    (root / "demo").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("x")
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(root))
+    monkeypatch.delenv("CODEBUILD_KEEP_WORKSPACE", raising=False)
+
+    codebuild._reap_workspace(str(root / ".." / "outside"), "demo:0001")
+
+    assert (outside / "keep.txt").exists()
+
+
+def test_reap_workspace_refuses_the_root_itself(monkeypatch, tmp_path):
+    root = tmp_path / "ws"
+    (root / "src").mkdir(parents=True)
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(root))
+    monkeypatch.delenv("CODEBUILD_KEEP_WORKSPACE", raising=False)
+
+    codebuild._reap_workspace(str(root), "demo:0001")
+
+    assert (root / "src").is_dir()
 
 
 def test_execute_build_keeps_its_workspace_when_asked(monkeypatch, tmp_path):
