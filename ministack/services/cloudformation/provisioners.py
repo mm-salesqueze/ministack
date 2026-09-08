@@ -8588,6 +8588,16 @@ def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
     source_region = get_region()
     removed = [r for r in old_regions if r not in new_regions and r != source_region]
     _ddb_unregister_replicas(name, removed, owned=owned)
+
+    # A RENAME LEAVES KEYS UNDER THE OLD NAME. Everything above is keyed on
+    # `name`, which _ddb_update may have changed -- and for an auto-named
+    # GlobalTable every replacement is a rename, since the name is derived from
+    # the physical id. The old name's replica keys were then never touched by
+    # anything: not here, and not by the delete handler, which reads the current
+    # props and so looks under the new name. They outlived the stack holding the
+    # orphaned pre-rename object.
+    if name != physical_id:
+        _ddb_unregister_replicas(physical_id, old_regions, owned=owned)
     if table is not None:
         # Every new region, not just the added ones: on a replacement the object
         # changed identity, so a region present in both lists still has to be

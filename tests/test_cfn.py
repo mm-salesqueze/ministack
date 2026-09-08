@@ -3218,6 +3218,32 @@ def test_global_table_does_not_clobber_a_stranger_on_update_or_delete(ddb_provis
     assert _ddb._tables.get_scoped(account, "eu-west-1", "sessions") is stranger
 
 
+def test_global_table_rename_leaves_no_keys_under_the_old_name(ddb_provisioner_scope):
+    """A rename must move the replica keys, not leave a set under the old name.
+
+    Everything in the update handler is keyed on the NEW name, and the delete
+    handler reads the current props -- so nothing ever looked under the old one
+    and its replica keys outlived the stack holding the orphaned pre-rename
+    object. For an auto-named GlobalTable every replacement is a rename, so it
+    always leaked.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    account = ddb_provisioner_scope
+
+    v1 = _global_table_props(name="reg-v1", replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_create("T", v1, "stk")
+    assert _replica_regions(account, "reg-v1") == ["eu-west-1", "us-east-1"]
+
+    v2 = _global_table_props(name="reg-v2", replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_update("reg-v1", v1, v2, "stk")
+
+    assert _replica_regions(account, "reg-v1") == []
+    assert _replica_regions(account, "reg-v2") == ["eu-west-1", "us-east-1"]
+
+    P._ddb_global_table_delete("reg-v2", v2)
+    assert _replica_regions(account, "reg-v2") == []
+
+
 def test_global_table_update_never_drops_the_source_region(ddb_provisioner_scope):
     """Removing the source region from Replicas must not delete the table.
 
