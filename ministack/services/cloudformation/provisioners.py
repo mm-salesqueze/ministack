@@ -1491,7 +1491,7 @@ def _ddb_replica_regions(props) -> list:
     return out
 
 
-def _ddb_register_replicas(name, table, regions, claimed=()) -> None:
+def _ddb_register_replicas(name, table, regions, owned=()) -> None:
     """Register one table object under each replica region's key.
 
     REFUSES to overwrite a DIFFERENT table that already sits at that key. Without
@@ -1503,16 +1503,21 @@ def _ddb_register_replicas(name, table, regions, claimed=()) -> None:
     trade: the replica is missing, which is the failure this patch set out to fix,
     but it is a visible one and it does not eat someone else's table.
 
-    `claimed` are regions this resource already registered on a previous pass, so
-    the key there is ours to repoint. That distinction matters on a REPLACEMENT:
-    the table object changes identity, so the key holds our own orphaned
-    predecessor -- which the guard above would otherwise mistake for a stranger's
-    table and refuse to touch, stranding the replica on the orphan.
+    OWNERSHIP IS BY OBJECT IDENTITY, never by region name. `owned` is the set of
+    table objects this resource is entitled to replace -- the current one and, on
+    an update, whatever it was before `_ddb_update` ran. Keying the exemption on
+    the region instead ("we registered eu-west-1 last time, so it is ours now")
+    reopened the hole this guard exists to close: the create refused to touch a
+    stranger's table, and the very next update overwrote it, because the region
+    was on the previous Replicas list. A region is not a claim; the object is.
     """
     account = get_account_id()
     for region in regions:
         existing = _dynamodb._tables.get_scoped(account, region, name)
-        if existing is not None and existing is not table and region not in claimed:
+        # `any(... is ...)`, not `in`: `in` compares with ==, and two distinct
+        # empty tables compare equal, which would hand a stranger's table over.
+        if (existing is not None and existing is not table
+                and not any(existing is o for o in owned)):
             logger.warning(
                 "GlobalTable %s: region %s already holds a different table of that "
                 "name; leaving it alone rather than replacing it. That replica will "
@@ -1521,12 +1526,17 @@ def _ddb_register_replicas(name, table, regions, claimed=()) -> None:
         _dynamodb._tables.set_scoped(account, region, name, table)
 
 
-def _ddb_unregister_replicas(name, regions, table=None) -> None:
-    """Drop the replica keys, leaving a table this stack did not create in place."""
+def _ddb_unregister_replicas(name, regions, owned=()) -> None:
+    """Drop the replica keys we own, leaving anyone else's table alone.
+
+    Same identity rule as the registration, and for the same reason: called with
+    nothing to compare against, this popped whatever happened to sit at the key,
+    so removing a region from `Replicas` deleted a stranger's table outright.
+    """
     account = get_account_id()
     for region in regions:
         existing = _dynamodb._tables.get_scoped(account, region, name)
-        if existing is None or (table is not None and existing is not table):
+        if existing is None or not any(existing is o for o in owned):
             continue
         _dynamodb._tables.pop_scoped(account, region, name, None)
 
@@ -1538,7 +1548,8 @@ def _ddb_global_table_delete(physical_id, props):
     # -- if an update could leave a stale region behind, the props here would no
     # longer name it and it would survive the stack as an undeletable phantom.
     table = _dynamodb._tables.get(physical_id)
-    _ddb_unregister_replicas(physical_id, _ddb_replica_regions(props), table)
+    _ddb_unregister_replicas(physical_id, _ddb_replica_regions(props),
+                             owned=(table,) if table is not None else ())
     _ddb_delete(physical_id, props)
 
 
@@ -8539,6 +8550,10 @@ def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
                  "WriteOnDemandThroughputSettings", "ReadOnDemandThroughputSettings",
                  "WriteProvisionedThroughputSettings", "ReadProvisionedThroughputSettings"):
         translated.pop(prop, None)
+    # Before the update, because a replacement rebuilds the table under a new
+    # object and this is the only chance to learn which one the replica keys are
+    # currently holding.
+    old_table = _dynamodb._tables.get(physical_id)
     name, attrs = _ddb_update(physical_id, old_props, translated, stack_name)
 
     # RECONCILE THE REPLICA SET. Stripping `Replicas` above and stopping there
@@ -8560,13 +8575,24 @@ def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
     old_regions = _ddb_replica_regions(old_props)
     new_regions = _ddb_replica_regions(new_props)
     table = _dynamodb._tables.get(name)
+    # OUR TWO OBJECTS: the table as it stands now, and whatever it was before
+    # `_ddb_update` ran -- a replacement swaps identity, so the replica keys still
+    # point at the predecessor and both count as ours to move. Everything else at
+    # those keys belongs to somebody else and is left alone.
+    owned = tuple(t for t in (table, old_table) if t is not None)
 
-    _ddb_unregister_replicas(name, [r for r in old_regions if r not in new_regions])
+    # THE SOURCE REGION IS NOT A REPLICA. Popping it because it fell off the
+    # Replicas list deleted the table itself, and the next update then found no
+    # table, built a fresh empty one, and repointed the surviving replicas at it
+    # -- every item gone, with no replacement event to show for it.
+    source_region = get_region()
+    removed = [r for r in old_regions if r not in new_regions and r != source_region]
+    _ddb_unregister_replicas(name, removed, owned=owned)
     if table is not None:
         # Every new region, not just the added ones: on a replacement the object
         # changed identity, so a region present in both lists still has to be
-        # repointed. `claimed=old_regions` says which keys are ours to repoint.
-        _ddb_register_replicas(name, table, new_regions, claimed=old_regions)
+        # repointed at the new one.
+        _ddb_register_replicas(name, table, new_regions, owned=owned)
 
     return name, attrs
 
