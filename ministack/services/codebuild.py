@@ -490,6 +490,152 @@ def _reap_workspace(workdir, build_id, keep_artifacts=True):
         os.rmdir(target)
     except OSError:
         pass
+# Bounds on an unpacked source, mirroring lambda_svc's _UNZIPPED_LIMIT_BYTES.
+_SOURCE_UNZIPPED_LIMIT_BYTES = int(os.environ.get(
+    "CODEBUILD_SOURCE_UNZIPPED_LIMIT_BYTES", str(512 * 1024 * 1024)))
+_SOURCE_MAX_MEMBERS = int(os.environ.get("CODEBUILD_SOURCE_MAX_MEMBERS", "200000"))
+
+
+def _effective_buildspec(source_dir: str, project: dict):
+    """The buildspec to run: the project's inline one, else the archive's own.
+
+    An inline buildspec used to be mandatory, so the normal AWS case -- an S3
+    source carrying its own buildspec.yml, which is what the agent reads -- failed
+    outright even though the file had just been extracted. And when an inline one
+    WAS supplied it was written over the extracted file, so a repo's real
+    buildspec could never run either way.
+
+    Returns (text, needs_writing). `needs_writing` is False for a buildspec that
+    is already on disk, so nothing overwrites it.
+    """
+    inline = (project.get("source") or {}).get("buildspec") or ""
+    # `.strip()` only to decide whether it is empty -- returning the stripped
+    # text would silently drop the trailing newline the caller wrote before.
+    if inline.strip():
+        return inline, True
+    for name in ("buildspec.yml", "buildspec.yaml"):
+        path = os.path.join(source_dir, name)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            if text.strip():
+                return text, False
+    return None, False
+
+
+def _populate_source_dir(source_dir: str, project: dict, build_id: str) -> bool:
+    """Put the project's SOURCE in the directory the build runs against.
+
+    Only the buildspec was ever written here, so a build ran against an
+    otherwise EMPTY directory whatever the project's `source` said. For a
+    project whose buildspec is self-contained that is invisible; for a real CI
+    project it is fatal in a confusing way, because the buildspec is present and
+    correct and every command in it fails on a file that is not there:
+
+        ./ci/ci-build.sh: No such file or directory
+
+    which reads as a broken repository rather than as source that was never
+    fetched.
+
+    S3 is implemented because it is the source type a local caller can actually
+    populate; a zip in a bucket is exactly what `StartBuild` with
+    `sourceTypeOverride=S3` expects. Git-backed types (GITHUB, BITBUCKET,
+    CODECOMMIT) still do nothing, deliberately: cloning would need credentials
+    and network, and silently substituting an empty tree for them is the bug
+    this fixes. They are logged so the reason is visible.
+    """
+    src = project.get("source") or {}
+    src_type = (src.get("type") or "NO_SOURCE").upper()
+
+    if src_type in ("NO_SOURCE", ""):
+        return True
+
+    if src_type != "S3":
+        logger.warning(
+            "Build %s: source type %s is not fetched; the build runs against an "
+            "empty source directory. Use sourceTypeOverride=S3 with a zip to "
+            "supply the tree.", build_id, src_type)
+        return True
+
+    import io
+    import zipfile
+
+    location = (src.get("location") or "").strip()
+    if location.startswith("s3://"):
+        location = location[len("s3://"):]
+    bucket_name, _, key = location.partition("/")
+    if not bucket_name or not key:
+        logger.error("Build %s: S3 source location %r is not <bucket>/<key>", build_id, location)
+        return False
+
+    from ministack.services import s3 as s3_svc
+
+    bucket = s3_svc._buckets.get(bucket_name)
+    obj = (bucket or {}).get("objects", {}).get(key)
+    if obj is None:
+        logger.error("Build %s: S3 source s3://%s/%s not found", build_id, bucket_name, key)
+        return False
+
+    # `_read_body`, not `obj["body"]`: with S3_PERSIST the body is spilled to
+    # disk and the in-memory field is left as None, so reading the record
+    # directly yields nothing and the archive looks corrupt rather than absent.
+    body = s3_svc._read_body(bucket_name, key, obj) or b""
+    try:
+        with zipfile.ZipFile(io.BytesIO(body)) as zf:
+            # A CAP ON THE UNCOMPRESSED SIZE, which lambda_svc has had for the
+            # identical operation. Measured: a 329 KB zip declaring 320 MB
+            # uncompressed wrote all 320 MB into the workspace in 0.2s -- about
+            # 1000:1, so a few MB of upload exhausts a tmpfs and takes down every
+            # other build. The member count is bounded too; a million empty files
+            # exhausts inodes just as effectively as one huge one.
+            total = sum(i.file_size for i in zf.infolist())
+            if total > _SOURCE_UNZIPPED_LIMIT_BYTES:
+                logger.error(
+                    "Build %s: S3 source s3://%s/%s unpacks to %d bytes, over the "
+                    "%d-byte limit; refusing to extract",
+                    build_id, bucket_name, key, total, _SOURCE_UNZIPPED_LIMIT_BYTES)
+                return False
+            if len(zf.infolist()) > _SOURCE_MAX_MEMBERS:
+                logger.error("Build %s: S3 source holds %d entries, over the %d limit",
+                             build_id, len(zf.infolist()), _SOURCE_MAX_MEMBERS)
+                return False
+            zf.extractall(source_dir)
+            # `extractall` does NOT restore the Unix mode; everything lands 0644.
+            # Real CodeBuild preserves it, and a CI buildspec runs the repo's own
+            # scripts -- so without this every `./ci/whatever.sh` fails with exit
+            # status 126, "found but not executable", which reads as a broken
+            # script rather than a lost permission bit.
+            #
+            # CHMOD THE PATH `extract` RETURNS, never `join(source_dir, info.filename)`.
+            # `extractall` sanitises entry names -- it strips leading slashes and `..`
+            # components -- but a raw join does not, and `os.path.join` discards its
+            # prefix entirely when the second argument is absolute. So an entry named
+            # `../victim` or `/etc/victim` escaped the workspace and this loop became an
+            # arbitrary-chmod primitive on any file the server can reach; `& 0o7777`
+            # handed over setuid with it. Measured: a zip carrying `../victim` with mode
+            # 0o104777 took a file OUTSIDE source_dir from 0644 to 4777.
+            #
+            # `extract` returns the real path it wrote, which is the sanitised one, so
+            # asking it is both simpler and correct.
+            #
+            # Masked to 0o777, not 0o7777: nothing in a source tree needs setuid or
+            # setgid, and all CodeBuild has to preserve here is the execute bit.
+            for info in zf.infolist():
+                mode = (info.external_attr >> 16) & 0o777
+                # Only a Unix-created archive carries a real mode in external_attr
+                # (create_system 3); anything else is DOS attribute flags, and reading
+                # those as a mode produces nonsense permissions.
+                if not mode or info.is_dir() or info.create_system != 3:
+                    continue
+                os.chmod(zf.extract(info, source_dir), mode)
+    except zipfile.BadZipFile:
+        logger.error("Build %s: S3 source s3://%s/%s is not a zip archive",
+                     build_id, bucket_name, key)
+        return False
+
+    logger.info("Build %s: unpacked %d bytes of source from s3://%s/%s",
+                build_id, len(body), bucket_name, key)
+    return True
 
 
 def _execute_build(build_id, project):
@@ -516,9 +662,21 @@ def _execute_build(build_id, project):
         for path in (source_dir, artifacts_dir, env_dir):
             os.makedirs(path, exist_ok=True)
 
-        buildspec = (project.get("source") or {}).get("buildspec") or ""
-        if not buildspec.strip():
-            logger.error("Build %s has no inline buildspec to execute", build_id)
+        # A SOURCE THAT CANNOT BE FETCHED FAILS THE BUILD. Every failure path in
+        # _populate_source_dir used to log and return while the caller ignored
+        # the result, so a bucket/key typo produced a green build -- and the
+        # phase list is pre-seeded SUCCEEDED, so the report actively asserted
+        # DOWNLOAD_SOURCE had worked. Real CodeBuild fails that phase.
+        if not _populate_source_dir(source_dir, project, build_id):
+            _record_phase(build, "DOWNLOAD_SOURCE", "FAILED")
+            _finish_build(build, "FAILED")
+            return
+
+        # The project's inline buildspec, or the one the archive brought with it.
+        buildspec, needs_writing = _effective_buildspec(source_dir, project)
+        if not buildspec:
+            logger.error("Build %s has no buildspec: none inline, and none in the "
+                         "source tree", build_id)
             _finish_build(build, "FAILED")
             # Reap here too: this return is inside the outer `try`, whose only
             # handler is the `except` below, so it never reaches the `finally`
@@ -530,8 +688,11 @@ def _execute_build(build_id, project):
             return
 
         buildspec_path = os.path.join(source_dir, "buildspec.yml")
-        with open(buildspec_path, "w", encoding="utf-8") as fh:
-            fh.write(buildspec)
+        # Only write when it came from the project -- writing an extracted
+        # buildspec back over itself is how the archive's own file got clobbered.
+        if needs_writing:
+            with open(buildspec_path, "w", encoding="utf-8") as fh:
+                fh.write(buildspec)
         _write_env_file(os.path.join(env_dir, "env.list"), project, build)
 
         _record_phase(build, "QUEUED", "SUCCEEDED")
