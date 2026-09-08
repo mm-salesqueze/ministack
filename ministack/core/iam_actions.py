@@ -316,6 +316,39 @@ def _s3_batch_delete_targets(bucket: str, body: bytes) -> list[tuple[str, str]]:
     return targets
 
 
+def ecr_additional_checks(method: str, path: str, headers: dict, body: bytes,
+                          query_params: dict) -> list[tuple[str, str]]:
+    """``(iam_action, resource_arn)`` pairs for the repositories beyond the first.
+
+    ``DescribeRepositories`` takes ``repositoryNames`` -- a list -- and AWS
+    authorises EVERY entry. ``extract_resource_arn`` can only return one ARN, so
+    it returns the first and this returns the rest; the caller enforces each in
+    turn, exactly as it already does for a multi-key S3 delete.
+
+    Without this the check was "the first name is allowed", which is not the same
+    question: a policy allowing repository/foo and explicitly denying
+    repository/bar let a call naming both through, where AWS denies it.
+    """
+    # KEYED ON THE PAYLOAD, not on one action name. `repositoryNames` is not
+    # unique to DescribeRepositories -- BatchGetRepositoryScanningConfiguration
+    # takes it too, and shares the same `names[0]` branch in
+    # extract_resource_arn, so an action-keyed guard left that one authorising
+    # the first repository only while a comment claimed it was covered. Reading
+    # the field instead makes this correct for every plural-name ECR action,
+    # including ones added later.
+    names = _safe_json_field(body, "repositoryNames")
+    if not isinstance(names, list) or len(names) < 2:
+        return []
+    action = extract_iam_action("ecr", method, path, headers, body, query_params)
+    if not action:
+        return []
+    from ministack.core.responses import get_account_id, get_region
+
+    region, account_id = get_region(), get_account_id()
+    return [(action, f"arn:aws:ecr:{region}:{account_id}:repository/{n}")
+            for n in names[1:] if n]
+
+
 def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
                          query_params: dict) -> list[tuple[str, str]]:
     """``(iam_action, resource_arn)`` pairs an S3 request needs on top of the
@@ -972,6 +1005,30 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     if service == "ecr":
         name = _safe_json_field(body, "repositoryName")
+        if not name:
+            # DescribeRepositories takes `repositoryNames` — a LIST — where the
+            # repository-scoped ECR calls take the singular `repositoryName`.
+            # BatchGetRepositoryScanningConfiguration takes the plural too, and
+            # shares this branch; `ecr_additional_checks` keys on the field
+            # rather than the action so both authorise every name. Reading only
+            # the singular made
+            # this resolve to "*", which matches no repository-scoped policy, so
+            # the call was denied against a policy that plainly allows it.
+            #
+            # That is not a corner: it is exactly what CDK's bootstrap grants its
+            # image-publishing role (ecr:DescribeRepositories on the container
+            # assets repository ARN), so under AUTH=true every CDK app with a
+            # Docker image asset failed to publish with "no identity-based policy
+            # allows the ecr:DescribeRepositories action".
+            #
+            # The FIRST name is the primary check; `ecr_additional_checks`
+            # carries the rest, so every named repository has to be allowed.
+            # Checking only the first would let a request AWS denies through --
+            # Allow on repository/foo plus an explicit Deny on repository/bar,
+            # asked about both, resolved to foo and passed.
+            names = _safe_json_field(body, "repositoryNames")
+            if isinstance(names, list) and names:
+                name = names[0]
         if name:
             return f"arn:aws:ecr:{region}:{account_id}:repository/{name}"
         return "*"

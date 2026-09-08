@@ -5,6 +5,50 @@ import pytest
 from botocore.exceptions import ClientError
 
 
+def test_ecr_describe_repositories_authorises_every_name():
+    """DescribeRepositories takes a LIST, and AWS authorises every entry.
+
+    extract_resource_arn can only answer with one ARN, so it returns the first
+    and ecr_additional_checks carries the rest. Resolving to the first alone
+    would let a policy allowing repository/foo and explicitly denying
+    repository/bar pass a call naming both.
+    """
+    import json as _json
+
+    from ministack.core.iam_actions import ecr_additional_checks, extract_resource_arn
+    from ministack.core.responses import set_request_account_id, set_request_region
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    headers = {"x-amz-target": "AmazonEC2ContainerRegistry_V20150921.DescribeRepositories"}
+    body = _json.dumps({"repositoryNames": ["foo", "bar", "baz"]}).encode()
+
+    primary = extract_resource_arn("ecr", "POST", "/", headers, body, {},
+                                   "us-east-1", "000000000000")
+    assert primary == "arn:aws:ecr:us-east-1:000000000000:repository/foo"
+
+    extras = ecr_additional_checks("POST", "/", headers, body, {})
+    assert [arn for _action, arn in extras] == [
+        "arn:aws:ecr:us-east-1:000000000000:repository/bar",
+        "arn:aws:ecr:us-east-1:000000000000:repository/baz",
+    ]
+    assert {action for action, _arn in extras} == {"ecr:DescribeRepositories"}
+
+    # A single name needs no extra checks -- the primary already covers it.
+    single = _json.dumps({"repositoryNames": ["solo"]}).encode()
+    assert ecr_additional_checks("POST", "/", headers, single, {}) == []
+
+    # Keyed on the FIELD, not one action: BatchGetRepositoryScanningConfiguration
+    # takes the same plural and shares the names[0] branch, so an action-keyed
+    # guard left it authorising the first repository only.
+    scanning = {"x-amz-target":
+                "AmazonEC2ContainerRegistry_V20150921.BatchGetRepositoryScanningConfiguration"}
+    assert [arn for _a, arn in ecr_additional_checks("POST", "/", scanning, body, {})] == [
+        "arn:aws:ecr:us-east-1:000000000000:repository/bar",
+        "arn:aws:ecr:us-east-1:000000000000:repository/baz",
+    ]
+
+
 def test_iam_role_user(iam):
     iam.create_role(
         RoleName="test-role",
