@@ -389,8 +389,26 @@ def _timeout_seconds(project):
     return max(1, minutes) * 60
 
 
-def _reap_workspace(workdir, build_id):
-    """Remove a finished build's workspace, but KEEP its artifacts.
+def _workspace_dirname(build_id):
+    """A single path segment for this build, whatever its project is called.
+
+    THE NAME IS ATTACKER-CONTROLLED. A build id is "<project>:<uuid>", and
+    CreateProject only checks the name is non-empty where AWS enforces
+    [A-Za-z0-9][A-Za-z0-9-_]{1,254} -- so `../../etc` is accepted and every use
+    of this path escaped WORKSPACE, not just the delete: os.makedirs, the env
+    file (which carries AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY), the
+    buildspec, and the zip extraction.
+
+    Bounding the deletion alone was the wrong half. Everything that touches the
+    workspace derives from this one value, so sanitising here is what actually
+    makes the containment true -- and it stays true for any writer added later,
+    which a check bolted onto the reaper does not.
+    """
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", build_id).lstrip(".") or "build"
+
+
+def _reap_workspace(workdir, build_id, keep_artifacts=True):
+    """Remove a finished build's workspace.
 
     Nothing else ever removed these: one directory per build, each holding the
     whole unpacked source, kept until the process was thrown away. WORKSPACE
@@ -398,19 +416,30 @@ def _reap_workspace(workdir, build_id):
     of a real repo fill it and the next one dies on "No space left on device"
     with gigabytes free on the actual disk.
 
-    `artifacts/` SURVIVES, and that is the whole subtlety. On AWS the workspace
-    is disposable because the artifacts have already been uploaded to S3 —
-    MiniStack uploads nothing, so this directory is the only copy that exists.
-    Reaping it wholesale silently destroyed the build output of anyone reading
-    `<workspace>/<build>/artifacts`, with an undocumented env var as the only way
-    back. Only `src/` and `env/` are ours to throw away.
+    `artifacts/` SURVIVES BY DEFAULT, and that is the whole subtlety. On AWS the
+    workspace is disposable because the artifacts have already gone to S3 --
+    MiniStack uploads nothing, so this directory is the only copy that exists,
+    and reaping it wholesale silently destroyed the build output.
 
-    Bounded to WORKSPACE. `workdir` is derived from a project name, and
-    CreateProject accepts names AWS would reject (it only checks non-empty, where
-    AWS enforces [A-Za-z0-9][A-Za-z0-9\\-_]{1,254}), so a name containing `..`
-    could put the target outside WORKSPACE entirely — and an empty
-    CODEBUILD_WORKSPACE_DIR makes it relative to the server's cwd. The realpath
-    check refuses anything that is not genuinely inside.
+    Keeping it unconditionally does not solve the problem this exists for,
+    though: `os.rmdir` below then never succeeds, because the build directory
+    always holds `artifacts/`, so one directory per build accumulates forever --
+    200 no-op builds leave 200 directories, measured. The caller passes
+    `keep_artifacts=False` when the project declares NO_ARTIFACTS, which is the
+    default and the dominant case: there is no output by definition, so the
+    directory is always empty and keeping it buys nothing.
+
+    A project that does declare artifacts still keeps them, and that retention is
+    still unbounded. The real fix is to upload them to the declared S3 location
+    the way CodeBuild does, after which nothing needs retaining at all; until
+    then this is the honest half -- never destroy an output, never hoard an empty
+    directory.
+
+    Bounded to WORKSPACE, belt and braces. `_workspace_dirname` already reduces
+    the build id to one safe path segment, so `workdir` cannot point outside;
+    this re-checks with realpath because an empty CODEBUILD_WORKSPACE_DIR makes
+    every path relative to the server's cwd, and because a delete is the one
+    operation whose blast radius is worth confirming twice.
     """
     if os.environ.get("CODEBUILD_KEEP_WORKSPACE", "") == "1":
         return
@@ -424,7 +453,8 @@ def _reap_workspace(workdir, build_id):
         return
 
     import shutil
-    for name in ("src", "env"):
+    doomed = ("src", "env") if keep_artifacts else ("src", "env", "artifacts")
+    for name in doomed:
         path = os.path.join(target, name)
         if not os.path.exists(path):
             continue
@@ -435,8 +465,9 @@ def _reap_workspace(workdir, build_id):
         except OSError as exc:
             logger.warning("Build %s: could not remove %s: %s", build_id, path, exc)
 
-    # The build directory itself, but only once it holds nothing but empties --
-    # so a kept `artifacts/` keeps its parent too.
+    # The build directory itself, once nothing is left in it. With artifacts kept
+    # this necessarily fails, which is the point -- their parent has to survive
+    # too; it only becomes reachable when keep_artifacts is False.
     try:
         os.rmdir(target)
     except OSError:
@@ -454,7 +485,11 @@ def _execute_build(build_id, project):
         return
 
     env = project.get("environment", {}) or {}
-    workdir = os.path.join(WORKSPACE, build_id.replace(":", "_"))
+    workdir = os.path.join(WORKSPACE, _workspace_dirname(build_id))
+    # NO_ARTIFACTS means there is no output by definition, so the artifacts
+    # directory is always empty and keeping it only leaks an inode per build.
+    keep_artifacts = ((project.get("artifacts") or {}).get("type") or
+                      "NO_ARTIFACTS").upper() != "NO_ARTIFACTS"
     source_dir = os.path.join(workdir, "src")
     artifacts_dir = os.path.join(workdir, "artifacts")
     env_dir = os.path.join(workdir, "env")
@@ -473,7 +508,7 @@ def _execute_build(build_id, project):
             # source has already been unpacked by the time we get here, so the
             # path that leaves a whole repo behind was exactly the path that
             # skipped cleanup.
-            _reap_workspace(workdir, build_id)
+            _reap_workspace(workdir, build_id, keep_artifacts)
             return
 
         buildspec_path = os.path.join(source_dir, "buildspec.yml")
@@ -523,7 +558,7 @@ def _execute_build(build_id, project):
         _finish_build(build, "FAULT")
         # Same reason as above: this handler returns without reaching the
         # `finally` further down, and the source is already on disk.
-        _reap_workspace(workdir, build_id)
+        _reap_workspace(workdir, build_id, keep_artifacts)
         return
 
     try:
@@ -608,7 +643,7 @@ def _execute_build(build_id, project):
             container.remove(force=True, v=True)
         except Exception:
             pass
-        _reap_workspace(workdir, build_id)
+        _reap_workspace(workdir, build_id, keep_artifacts)
 
 
 # ---------------------------------------------------------------------------
