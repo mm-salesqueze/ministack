@@ -438,13 +438,29 @@ def _populate_source_dir(source_dir: str, project: dict, build_id: str) -> None:
             # scripts -- so without this every `./ci/whatever.sh` fails with exit
             # status 126, "found but not executable", which reads as a broken
             # script rather than a lost permission bit.
+            #
+            # CHMOD THE PATH `extract` RETURNS, never `join(source_dir, info.filename)`.
+            # `extractall` sanitises entry names -- it strips leading slashes and `..`
+            # components -- but a raw join does not, and `os.path.join` discards its
+            # prefix entirely when the second argument is absolute. So an entry named
+            # `../victim` or `/etc/victim` escaped the workspace and this loop became an
+            # arbitrary-chmod primitive on any file the server can reach; `& 0o7777`
+            # handed over setuid with it. Measured: a zip carrying `../victim` with mode
+            # 0o104777 took a file OUTSIDE source_dir from 0644 to 4777.
+            #
+            # `extract` returns the real path it wrote, which is the sanitised one, so
+            # asking it is both simpler and correct.
+            #
+            # Masked to 0o777, not 0o7777: nothing in a source tree needs setuid or
+            # setgid, and all CodeBuild has to preserve here is the execute bit.
             for info in zf.infolist():
-                mode = info.external_attr >> 16
-                if not mode:
+                mode = (info.external_attr >> 16) & 0o777
+                # Only a Unix-created archive carries a real mode in external_attr
+                # (create_system 3); anything else is DOS attribute flags, and reading
+                # those as a mode produces nonsense permissions.
+                if not mode or info.is_dir() or info.create_system != 3:
                     continue
-                target = os.path.join(source_dir, info.filename)
-                if os.path.exists(target) and not info.is_dir():
-                    os.chmod(target, mode & 0o7777)
+                os.chmod(zf.extract(info, source_dir), mode)
     except zipfile.BadZipFile:
         logger.error("Build %s: S3 source s3://%s/%s is not a zip archive",
                      build_id, bucket_name, key)
