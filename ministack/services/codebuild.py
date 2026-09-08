@@ -484,10 +484,15 @@ def _reap_workspace(workdir, build_id, keep_artifacts=True):
         os.rmdir(target)
     except OSError:
         pass
-# Bounds on an unpacked source, mirroring lambda_svc's _UNZIPPED_LIMIT_BYTES.
+# Bounds on an unpacked source. DELIBERATELY NOT lambda_svc's number: that one is a
+# Lambda package limit, and a CodeBuild source is an ENTIRE REPOSITORY -- app-r12
+# unpacks to 1.01 GB, and a 512MB cap rejected it as a zip bomb, failing the build
+# in DOWNLOAD_SOURCE with no log output at all to say why.
+#
+# This is a disk-exhaustion guard, so it only has to sit below "fills the volume".
 _SOURCE_UNZIPPED_LIMIT_BYTES = int(os.environ.get(
-    "CODEBUILD_SOURCE_UNZIPPED_LIMIT_BYTES", str(512 * 1024 * 1024)))
-_SOURCE_MAX_MEMBERS = int(os.environ.get("CODEBUILD_SOURCE_MAX_MEMBERS", "200000"))
+    "CODEBUILD_SOURCE_UNZIPPED_LIMIT_BYTES", str(8 * 1024 * 1024 * 1024)))
+_SOURCE_MAX_MEMBERS = int(os.environ.get("CODEBUILD_SOURCE_MAX_MEMBERS", "1000000"))
 
 
 def _effective_buildspec(source_dir: str, project: dict):
