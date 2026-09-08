@@ -810,14 +810,25 @@ function patchAwsSdk() {
     // cleartext, so a function talking to its own TLS sidecar on :8443 got
     // ministack's response body. 443 and a missing port are ministack; any other
     // explicit port is a deliberate destination and is left alone.
+    // The downgrade is deliberately BROAD here -- any loopback port, as upstream
+    // has always done and as test_nodejs_worker_https_localhost_downgraded_to_http
+    // asserts. This worker runs the handler in a subprocess against a caller-chosen
+    // local port, so narrowing it the way the container shim does would change
+    // documented behaviour that has a test.
+    //
+    // What DOES change is 443. It is the https default -- the port node fills in
+    // when the URL carried none -- so preserving it meant AWS's own cfn-response
+    // module, which builds {hostname, port: 443} from the parsed ResponseURL, was
+    // dialled at :443 over cleartext and got ECONNREFUSED; the custom resource
+    // could then only end by timing out. 443 and a missing port both mean "no
+    // port was really specified" and become ministack's; any other explicit port
+    // is preserved, which is what keeps the arbitrary-port case working.
     const localPort = options.port == null || options.port === ""
       ? portOf(options.host) : parseInt(options.port, 10);
-    if ((host === "127.0.0.1" || host === "localhost" || host === msHost)
-        && (localPort === null || localPort === 443 || localPort === msPort)) {
+    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
       options.protocol = "http:";
-      options.port = msPort;
-      options.hostname = msHost;
-      options.host = msHost + ":" + msPort;
+      options.port = (localPort === null || localPort === 443) ? msPort : localPort;
+      options.host = host + ":" + options.port;
       options.agent = msAgent;
       delete options._defaultAgent;
       return http.request(options, callback);
