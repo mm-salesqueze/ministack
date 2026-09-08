@@ -167,7 +167,25 @@ def _make_build_record(project, build_id, source_version=None):
         },
         "timeoutInMinutes": project.get("timeoutInMinutes", 60),
         "initiator": f"{get_account_id()}/user",
-        "encryptionKey": f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild",
+        # FROM THE PROJECT, which is the override-applied copy by the time this
+        # is called -- not a hardcoded value. Six of the StartBuild overrides
+        # (cache, serviceRole, encryptionKey, queuedTimeoutInMinutes and the two
+        # secondary lists) landed on that copy and then went nowhere, because
+        # this record only carried four fields, so BatchGetBuilds reported the
+        # project's values and the override looked ignored. All six are real
+        # members of the Build shape, checked against botocore's codebuild model.
+        #
+        # `logsConfig` deliberately not among them: a project has a logsConfig,
+        # a build has `logs` (a LogsLocation), so the override is accepted and
+        # shapes the build's configuration without being echoed back here.
+        "encryptionKey": project.get(
+            "encryptionKey",
+            f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild"),
+        "serviceRole": project.get("serviceRole", ""),
+        "cache": project.get("cache", {"type": "NO_CACHE"}),
+        "queuedTimeoutInMinutes": project.get("queuedTimeoutInMinutes", 480),
+        "secondaryArtifacts": project.get("secondaryArtifacts", []),
+        "secondarySources": project.get("secondarySources", []),
     }
 
 
@@ -679,12 +697,94 @@ def _delete_project(data):
 # Build handlers
 # ---------------------------------------------------------------------------
 
+def _apply_start_build_overrides(project, data):
+    """Return a copy of `project` with StartBuild's `*Override` fields applied.
+
+    StartBuild takes roughly thirty `...Override` parameters and this read none
+    of them: a caller could pass `environmentVariablesOverride` or
+    `sourceLocationOverride` and the build ran with the project's own values,
+    silently. That is the worst shape for an override — it does not fail, it
+    just does something else — and it is exactly how a CI project is driven
+    against a source other than the one it was defined with, which is what any
+    local run of a real project needs.
+
+    Applied to a COPY, because an override is per-build: mutating the project
+    would make the next build inherit it.
+    """
+    effective = copy.deepcopy(project)
+
+    # `or {}`, not just setdefault: CreateProject passes an explicit JSON null
+    # straight through, and setdefault returns that None, so `env[key] = ...`
+    # raised TypeError and answered 500 instead of an API error.
+    env = effective.setdefault("environment", {}) or {}
+    effective["environment"] = env
+    for field, key in (("imageOverride", "image"),
+                       ("computeTypeOverride", "computeType"),
+                       ("environmentTypeOverride", "type"),
+                       ("privilegedModeOverride", "privilegedMode"),
+                       ("imagePullCredentialsTypeOverride", "imagePullCredentialsType"),
+                       ("certificateOverride", "certificate")):
+        if data.get(field) is not None:
+            env[key] = data[field]
+
+    # Merged by NAME, as AWS does: an override replaces the project's variable
+    # of the same name and adds the rest, rather than replacing the whole list.
+    if data.get("environmentVariablesOverride") is not None:
+        existing = {v.get("name"): dict(v) for v in env.get("environmentVariables") or []
+                    if v.get("name")}
+        unnamed = [dict(v) for v in env.get("environmentVariables") or [] if not v.get("name")]
+        for var in data["environmentVariablesOverride"]:
+            # A variable with no name cannot participate in a merge BY name --
+            # keyed on None they all collapsed into one. Kept in order instead.
+            if var.get("name"):
+                existing[var["name"]] = dict(var)
+            else:
+                unnamed.append(dict(var))
+        env["environmentVariables"] = list(existing.values()) + unnamed
+
+    source = effective.setdefault("source", {}) or {}
+    effective["source"] = source
+    for field, key in (("sourceTypeOverride", "type"),
+                       ("sourceLocationOverride", "location"),
+                       ("buildspecOverride", "buildspec"),
+                       ("gitCloneDepthOverride", "gitCloneDepth"),
+                       ("reportBuildStatusOverride", "reportBuildStatus"),
+                       ("insecureSslOverride", "insecureSsl")):
+        if data.get(field) is not None:
+            source[key] = data[field]
+    if data.get("gitSubmodulesConfigOverride") is not None:
+        source["gitSubmodulesConfig"] = data["gitSubmodulesConfigOverride"]
+    if data.get("sourceAuthOverride") is not None:
+        source["auth"] = data["sourceAuthOverride"]
+
+    if data.get("artifactsOverride") is not None:
+        effective["artifacts"] = data["artifactsOverride"]
+    if data.get("secondaryArtifactsOverride") is not None:
+        effective["secondaryArtifacts"] = data["secondaryArtifactsOverride"]
+    if data.get("secondarySourcesOverride") is not None:
+        effective["secondarySources"] = data["secondarySourcesOverride"]
+    if data.get("cacheOverride") is not None:
+        effective["cache"] = data["cacheOverride"]
+    if data.get("serviceRoleOverride") is not None:
+        effective["serviceRole"] = data["serviceRoleOverride"]
+    if data.get("timeoutInMinutesOverride") is not None:
+        effective["timeoutInMinutes"] = data["timeoutInMinutesOverride"]
+    if data.get("queuedTimeoutInMinutesOverride") is not None:
+        effective["queuedTimeoutInMinutes"] = data["queuedTimeoutInMinutesOverride"]
+    if data.get("logsConfigOverride") is not None:
+        effective["logsConfig"] = data["logsConfigOverride"]
+    if data.get("encryptionKeyOverride") is not None:
+        effective["encryptionKey"] = data["encryptionKeyOverride"]
+
+    return effective
+
+
 def _start_build(data):
     project_name = data.get("projectName", "")
     if not project_name or project_name not in _projects:
         return error_response_json("ResourceNotFoundException",
                                    f"Project not found: {project_name}", 400)
-    project = _projects[project_name]
+    project = _apply_start_build_overrides(_projects[project_name], data)
     bid = _build_id(project_name)
     build = _make_build_record(project, bid, data.get("sourceVersion"))
 
@@ -707,7 +807,7 @@ def _start_build(data):
         context = contextvars.copy_context()
         threading.Thread(
             target=context.run,
-            args=(_execute_build, bid, copy.deepcopy(project)),
+            args=(_execute_build, bid, project),
             daemon=True,
         ).start()
 
