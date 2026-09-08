@@ -135,6 +135,104 @@ def _template_tags(value):
     return value
 
 
+@pytest.fixture
+def cognito_idp_scope():
+    """Two user pools and an ambient scope for driving the IdP provisioners."""
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import cognito as _cognito
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    added = []
+    for pid in ("pool-src", "pool-dst"):
+        if pid not in _cognito._user_pools:
+            _cognito._user_pools[pid] = {"Id": pid}
+            added.append(pid)
+    try:
+        yield "pool-src", "pool-dst"
+    finally:
+        for pid in added:
+            _cognito._user_pools.pop(pid, None)
+
+
+def _idp_props(pool, name="Google", ptype="Google"):
+    return {"UserPoolId": pool, "ProviderName": name, "ProviderType": ptype,
+            "ProviderDetails": {"client_id": "x", "client_secret": "y",
+                                "authorize_scopes": "email"}}
+
+
+def test_idp_failed_move_does_not_destroy_the_provider(cognito_idp_scope):
+    """A move must create into the new pool BEFORE removing from the old one.
+
+    Popping first meant a create that raises left the provider in NEITHER pool --
+    and rollback does not restore it, because the physical id never changed so
+    stacks.py explicitly skips it ("An in-place change is not reverted here").
+    Permanent, silent loss.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import cognito as _cognito
+    src, _dst = cognito_idp_scope
+
+    props = _idp_props(src)
+    P._cognito_user_pool_identity_provider_create("Idp", props, "stk")
+    assert list(_cognito._user_pools[src]["_identity_providers"]) == ["Google"]
+
+    moved = _idp_props("pool-does-not-exist")
+    with pytest.raises(ValueError):
+        P._cognito_user_pool_identity_provider_update("Google", props, moved, "stk")
+
+    # The provider must still be where it was.
+    assert list(_cognito._user_pools[src]["_identity_providers"]) == ["Google"]
+
+
+def test_idp_move_is_idempotent(cognito_idp_scope):
+    """Re-running an already-applied move must not fail the stack.
+
+    After a rolled-back update the move can already be applied while the template
+    still describes the old pool, so `aws cloudformation deploy` retried the same
+    change and hit "already exists" -- permanently wedging a stack that had
+    updated fine.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import cognito as _cognito
+    src, dst = cognito_idp_scope
+
+    before = _idp_props(src)
+    after = _idp_props(dst)
+    P._cognito_user_pool_identity_provider_create("Idp", before, "stk")
+    P._cognito_user_pool_identity_provider_update("Google", before, after, "stk")
+    assert list(_cognito._user_pools[dst]["_identity_providers"]) == ["Google"]
+
+    # Same update again -- must be a no-op, not a raise.
+    P._cognito_user_pool_identity_provider_update("Google", before, after, "stk")
+    assert list(_cognito._user_pools[dst]["_identity_providers"]) == ["Google"]
+    assert list(_cognito._user_pools[src].get("_identity_providers", {})) == []
+
+
+def test_idp_provider_name_change_is_a_replacement(cognito_idp_scope):
+    """AWS marks ProviderName and ProviderType as Replacement.
+
+    Both were silently ignored: the stack reported UPDATE_COMPLETE while the pool
+    still held the old provider under the old name and type.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import cognito as _cognito
+    src, _dst = cognito_idp_scope
+
+    before = _idp_props(src, name="Google", ptype="Google")
+    P._cognito_user_pool_identity_provider_create("Idp", before, "stk")
+
+    after = _idp_props(src, name="GoogleV2", ptype="LoginWithAmazon")
+    pid, _attrs = P._cognito_user_pool_identity_provider_update(
+        "Google", before, after, "stk")
+
+    # A changed physical id is what makes the engine record a replacement.
+    assert pid == "GoogleV2"
+    providers = _cognito._user_pools[src]["_identity_providers"]
+    assert "GoogleV2" in providers
+    assert providers["GoogleV2"]["ProviderType"] == "LoginWithAmazon"
+
+
 def test_cfn_region_scopes_stacks_change_sets_and_events():
     suffix = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-regional-{suffix}"
