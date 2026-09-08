@@ -5398,6 +5398,153 @@ def _cognito_user_pool_domain_delete(physical_id, props):
             pool["Domain"] = None
 
 
+def _cognito_user_pool_identity_provider_create(logical_id, props, stack_name):
+    """Provision an AWS::Cognito::UserPoolIdentityProvider onto the store the API already uses.
+
+    Cognito implements identity providers in full — Create/Describe/Update/Delete
+    /List, kept in the pool's own `_identity_providers` map. Only the
+    CloudFormation wiring was missing, so a stack that federates to Google or an
+    OIDC provider could not deploy at all; it rolled back on `Unsupported
+    resource type` and took every other resource in the stack with it. That is a
+    single social login costing the whole application.
+
+    Written against the same map `_create_identity_provider` writes, so a
+    provider created by CloudFormation is indistinguishable from one created over
+    the API — DescribeIdentityProvider and ListIdentityProviders find it, and
+    hosted-UI login flows see it, which is the point of having one.
+    """
+    pid = props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(pid)
+    if not pool:
+        raise ValueError(f"UserPool {pid} not found for UserPoolIdentityProvider")
+
+    provider_name = props.get("ProviderName")
+    if not provider_name:
+        raise ValueError("AWS::Cognito::UserPoolIdentityProvider requires ProviderName")
+    provider_type = props.get("ProviderType")
+    if not provider_type:
+        raise ValueError("AWS::Cognito::UserPoolIdentityProvider requires ProviderType")
+    if provider_type not in _cognito.VALID_PROVIDER_TYPES:
+        raise ValueError(f"Invalid ProviderType: {provider_type}")
+
+    # ProviderDetails is REQUIRED by the CloudFormation schema, and an IdP
+    # without it can never complete a login -- no client id, no secret, no
+    # issuer. Defaulting it to {} let such a template deploy green and fail at
+    # the first sign-in instead.
+    details = props.get("ProviderDetails")
+    if not details:
+        raise ValueError(
+            "AWS::Cognito::UserPoolIdentityProvider requires ProviderDetails")
+
+    # The API returns DuplicateProviderException here; silently overwriting meant
+    # two resources declaring the same ProviderName in one pool both "succeeded"
+    # and the second quietly won, where AWS fails the stack.
+    existing = pool.setdefault("_identity_providers", {})
+    if provider_name in existing:
+        raise ValueError(
+            f"Identity provider {provider_name} already exists in user pool {pid}")
+
+    now = _cognito._now_epoch()
+    existing[provider_name] = {
+        "UserPoolId": pid,
+        "ProviderName": provider_name,
+        "ProviderType": provider_type,
+        "ProviderDetails": details,
+        "AttributeMapping": props.get("AttributeMapping", {}) or {},
+        "IdpIdentifiers": props.get("IdpIdentifiers", []) or [],
+        "CreationDate": now,
+        "LastModifiedDate": now,
+    }
+    # Ref on this resource type returns the ProviderName (matches real AWS —
+    # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolidentityprovider.html#aws-resource-cognito-userpoolidentityprovider-return-values).
+    return provider_name, {}
+
+
+def _cognito_user_pool_identity_provider_update(physical_id, old_props, new_props, stack_name):
+    """Update in place, or MOVE the provider when its pool changes.
+
+    AWS marks `UserPoolId` "Update requires: Replacement", but the physical id of
+    this resource is the ProviderName (that is what Ref returns), and the
+    provider name does not change when the pool does. So the engine saw an
+    unchanged physical id, decided nothing was replaced, and never deleted the
+    predecessor -- the provider stayed registered on the OLD pool, whose hosted
+    UI went on offering a login the template no longer described.
+
+    Handling the move here keeps Ref correct while still removing the old one.
+    """
+    old_pool_id = old_props.get("UserPoolId", "")
+    new_pool_id = new_props.get("UserPoolId", "")
+    new_name = new_props.get("ProviderName") or physical_id
+    new_type = new_props.get("ProviderType")
+    old_type = old_props.get("ProviderType")
+
+    # A NAME OR TYPE CHANGE IS A REPLACEMENT, which AWS marks both as. Both were
+    # silently ignored -- the stack reported UPDATE_COMPLETE while the pool still
+    # held the old provider under the old name and type. Returning a DIFFERENT
+    # physical id is what makes the engine record a replacement and clean up the
+    # predecessor, so this creates the new one and lets that machinery run.
+    if new_name != physical_id or (new_type and old_type and new_type != old_type):
+        created = _cognito_user_pool_identity_provider_create(
+            "Idp", new_props, stack_name)
+        if new_name != physical_id:
+            old_pool = _cognito._user_pools.get(old_pool_id or new_pool_id)
+            if old_pool:
+                old_pool.get("_identity_providers", {}).pop(physical_id, None)
+        return created
+
+    if old_pool_id and new_pool_id and old_pool_id != new_pool_id:
+        # CREATE FIRST, THEN REMOVE. Popping the old pool before a create that
+        # can raise left the provider in NEITHER pool, and rollback does not
+        # restore it: the physical id never changed, so stacks.py explicitly
+        # skips the resource ("An in-place change is not reverted here"). That is
+        # permanent, silent loss for a template that merely named a pool wrong.
+        #
+        # AND IDEMPOTENT. A rolled-back update can leave the move already
+        # applied while the template still describes the old pool, so a retry of
+        # the identical change hit the strict create's "already exists" and
+        # wedged a stack that had updated fine. An existing provider of this name
+        # in the TARGET pool is ours -- update it in place instead.
+        target = _cognito._user_pools.get(new_pool_id)
+        if target is None:
+            raise ValueError(
+                f"UserPool {new_pool_id} not found for UserPoolIdentityProvider")
+        existing = target.setdefault("_identity_providers", {}).get(physical_id)
+        if existing is None:
+            _cognito_user_pool_identity_provider_create("Idp", new_props, stack_name)
+        else:
+            for prop in ("ProviderDetails", "AttributeMapping", "IdpIdentifiers"):
+                existing[prop] = new_props.get(prop) or existing.get(prop) or (
+                    {} if prop != "IdpIdentifiers" else [])
+            existing["LastModifiedDate"] = _cognito._now_epoch()
+
+        old_pool = _cognito._user_pools.get(old_pool_id)
+        if old_pool:
+            old_pool.get("_identity_providers", {}).pop(physical_id, None)
+        return physical_id, {}
+
+    # Same pool: the mutable properties change in place, which is what AWS's
+    # "No interruption" means for them.
+    pool = _cognito._user_pools.get(new_pool_id)
+    record = (pool or {}).get("_identity_providers", {}).get(physical_id)
+    if record is None:
+        return _cognito_user_pool_identity_provider_create(
+            physical_id, new_props, stack_name)
+    # ABSENCE RESETS. `if prop in new_props` left a property removed from the
+    # template at its old value, where AWS resets it.
+    for prop, empty in (("ProviderDetails", {}), ("AttributeMapping", {}),
+                        ("IdpIdentifiers", [])):
+        record[prop] = new_props.get(prop) or empty
+    record["LastModifiedDate"] = _cognito._now_epoch()
+    return physical_id, {}
+
+
+def _cognito_user_pool_identity_provider_delete(physical_id, props):
+    pool = _cognito._user_pools.get(props.get("UserPoolId", ""))
+    if not pool:
+        return
+    pool.get("_identity_providers", {}).pop(physical_id, None)
+
+
 # ===========================================================================
 # --- ECR resource provisioners ---
 
@@ -9275,6 +9422,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
+    "AWS::Cognito::UserPoolIdentityProvider": {"create": _cognito_user_pool_identity_provider_create, "update": _cognito_user_pool_identity_provider_update, "delete": _cognito_user_pool_identity_provider_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
     "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
