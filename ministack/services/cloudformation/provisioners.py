@@ -149,6 +149,36 @@ _CF_LIST_ITEM_TAGS = {
     # half wrong drops every custom and removed header silently.
     "CustomHeadersConfig": "ResponseHeadersPolicyCustomHeader",
     "RemoveHeadersConfig": "ResponseHeadersPolicyRemoveHeader",
+    # DistributionConfig's own lists.
+    "Aliases": "CNAME",
+    "Origins": "Origin",
+    "OriginGroups": "OriginGroup",
+    "CacheBehaviors": "CacheBehavior",
+    "CustomErrorResponses": "CustomErrorResponse",
+    # Keyed on the XML name, not the CloudFormation one: OriginCustomHeaders is renamed to
+    # CustomHeaders before the tag is looked up. Miss the entry and the children are emitted as
+    # <Name>, which a NAME-MATCHING REST-XML SDK (Go v2, Java v2) reads as Quantity 2 with an
+    # empty Items list -- the header silently absent rather than malformed. botocore is more
+    # forgiving and parses them back, so a Python-only test will not show this.
+    "CustomHeaders": "OriginCustomHeader",
+    "AllowedMethods": "Method",
+    "CachedMethods": "Method",
+    "FunctionAssociations": "FunctionAssociation",
+    "LambdaFunctionAssociations": "LambdaFunctionAssociation",
+    "OriginSslProtocols": "SslProtocol",
+    "StatusCodes": "StatusCode",
+    "TrustedKeyGroups": "KeyGroup",
+    "TrustedSigners": "AwsAccountNumber",
+    # GeoRestriction is the counted block itself in the XML (CFN nests the
+    # countries under `Locations`, which _cf_normalise_distribution_props folds
+    # in), and its items are <Location>. Without this the countries went out as
+    # <Name> and botocore dropped the lot.
+    "GeoRestriction": "Location",
+    # The one remaining DistributionConfig list whose items are not <Name>:
+    # OriginGroup.Members. Its entries are dicts, so the wrong tag produced
+    # <Name><OriginId>…</OriginId></Name> -- exactly the shape this table exists
+    # to prevent.
+    "Members": "OriginGroupMember",
 }
 
 
@@ -166,23 +196,56 @@ def _cf_props_to_element(tag, value):
             # (`AccessControlAllowHeaders: {Items: [..]}`); XML wants both as a
             # counted Items block.
             listed = None
+            siblings = {}
             if isinstance(item, list):
                 listed = item
-            elif isinstance(item, dict) and set(item) <= {"Items", "Quantity"} and isinstance(item.get("Items"), list):
+            elif isinstance(item, dict) and isinstance(item.get("Items"), list):
                 listed = item["Items"]
+                # A counted block may carry members beside its list —
+                # `AllowedMethods` holds `CachedMethods`, which is the one place
+                # CloudFormation's shape and the XML's genuinely differ in
+                # nesting rather than in naming.
+                siblings = {k: v for k, v in item.items()
+                            if k not in ("Items", "Quantity")}
 
             if listed is not None:
                 block = SubElement(parent, key)
-                SubElement(block, "Quantity").text = str(len(listed))
-                if listed:
+                item_tag = _CF_LIST_ITEM_TAGS.get(key, "Name")
+
+                def _emit_quantity():
+                    SubElement(block, "Quantity").text = str(len(listed))
+
+                def _emit_items():
+                    # ALWAYS, even when empty: `Items` is a required member on
+                    # Origins, AllowedMethods, CachedMethods, OriginSslProtocols,
+                    # StatusCodes and OriginGroup.Members, so omitting it for an
+                    # empty list produced a Quantity with no Items -- invalid
+                    # however sensible it reads.
                     items_el = SubElement(block, "Items")
-                    item_tag = _CF_LIST_ITEM_TAGS.get(key, "Name")
                     for entry in listed:
                         child = SubElement(items_el, item_tag)
                         if isinstance(entry, dict):
                             fill(child, entry)
                         else:
                             child.text = str(entry)
+
+                # IN THE ORDER THE DICT GIVES, which the model pass has already
+                # set. Emitting Quantity, then Items, then the siblings put every
+                # sibling last regardless of where the model wants it --
+                # TrustedKeyGroups.Enabled and GeoRestriction.RestrictionType both
+                # belong FIRST, and CloudFront's XML is sequence-typed.
+                order = [k for k in item.keys()] if isinstance(item, dict) else []
+                if "Quantity" not in order:
+                    order.insert(0, "Quantity")
+                if "Items" not in order:
+                    order.insert(order.index("Quantity") + 1, "Items")
+                for name in order:
+                    if name == "Quantity":
+                        _emit_quantity()
+                    elif name == "Items":
+                        _emit_items()
+                    elif name in siblings:
+                        fill(block, {name: siblings[name]})
             elif isinstance(item, dict):
                 fill(SubElement(parent, key), item)
             elif isinstance(item, bool):
@@ -7396,13 +7459,265 @@ def _cf_oai_delete(physical_id, props):
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
+# CloudFormation property name -> the element name CloudFront's XML uses. Both
+# come from the same AWS model, so the whole list is these two.
+_CF_DIST_RENAMES = {
+    "OriginCustomHeaders": "CustomHeaders",
+    "OriginSSLProtocols": "OriginSslProtocols",
+    # CloudFormation lower-cases these acronyms and the XML does not. Checked
+    # against botocore's cloudfront model rather than guessed: ViewerCertificate's
+    # members really are ACMCertificateArn / IAMCertificateId / SSLSupportMethod,
+    # and DistributionConfig's flag really is IsIPV6Enabled.
+    #
+    # Omitting them did not produce a malformed document, which is why it went
+    # unnoticed: the SDK simply does not recognise the element and drops it, so a
+    # distribution with a custom domain read back as though it had no
+    # certificate at all, and Terraform saw permanent drift.
+    "AcmCertificateArn": "ACMCertificateArn",
+    "IamCertificateId": "IAMCertificateId",
+    "SslSupportMethod": "SSLSupportMethod",
+    "IPV6Enabled": "IsIPV6Enabled",
+}
+
+
+_CF_MODEL_SHAPE_CACHE = {}
+
+# Members the CloudFront XML requires and CloudFormation does not carry, where
+# the right value is SEMANTIC rather than a type default. CFN expresses these by
+# absence or by emptiness, so only the schema knows what absence meant.
+_CF_XML_SEMANTIC_DEFAULTS = {
+    # "enabled" is the list being non-empty...
+    ("TrustedSigners", "Enabled"): lambda block: bool(block.get("Items")),
+    ("TrustedKeyGroups", "Enabled"): lambda block: bool(block.get("Items")),
+    # ...and for logging it is the block being present at all.
+    ("LoggingConfig", "Enabled"): lambda block: True,
+    # CFN omits these for an OAC-based origin; the XML still wants the field.
+    ("S3OriginConfig", "OriginAccessIdentity"): lambda block: "",
+    # CFN's documented defaults for the ports it treats as optional.
+    ("CustomOriginConfig", "HTTPPort"): lambda block: 80,
+    ("CustomOriginConfig", "HTTPSPort"): lambda block: 443,
+}
+
+
+def _cf_model_shape(name="DistributionConfig"):
+    """The CloudFront shape for `name`, or None if the model cannot be read.
+
+    botocore is a pinned runtime dependency (it is what the IAM layer reads
+    service models from), so this is not an optional import -- but it is loaded
+    lazily and failure degrades to the previous behaviour rather than breaking a
+    provision.
+    """
+    if name in _CF_MODEL_SHAPE_CACHE:
+        return _CF_MODEL_SHAPE_CACHE[name]
+    shape = None
+    try:
+        import gzip
+        import json as _json
+        import os as _os
+
+        import botocore
+        from botocore.model import ServiceModel
+
+        root = _os.path.join(_os.path.dirname(botocore.__file__), "data", "cloudfront")
+        version = sorted(_os.listdir(root))[-1]
+        path = _os.path.join(root, version, "service-2.json")
+        raw = (gzip.open(path + ".gz").read() if _os.path.exists(path + ".gz")
+               else open(path, "rb").read())
+        shape = ServiceModel(_json.loads(raw)).shape_for(name)
+    except Exception:
+        logger.debug("Could not load the CloudFront model; emitting "
+                     "DistributionConfig without model ordering")
+    _CF_MODEL_SHAPE_CACHE[name] = shape
+    return shape
+
+
+def _cf_conform_to_model(value, shape):
+    """Order members as the model does, and supply the ones the XML requires.
+
+    TWO PROBLEMS, ONE PASS, because both need the schema.
+
+    ORDER. CloudFront's REST-XML structures are sequence-typed, so a member in
+    the wrong position is invalid however correct its name -- and a name-matching
+    SDK is entitled to reject the document. The emitted order was the template's
+    JSON key order, which is arbitrary, and every member added by hand landed
+    wherever `setdefault` appended it. Parsing the result back with botocore does
+    not show this, which is why it went unnoticed.
+
+    REQUIRED MEMBERS. A handful are required by the model and simply absent from
+    the CloudFormation schema, so nothing downstream can supply them: Comment,
+    ForwardedValues.Cookies, Cookies.Forward, S3OriginConfig.OriginAccessIdentity,
+    the ports, and the Enabled flags CFN expresses by absence. Filling them from
+    the schema rather than one at a time is what stops the list going stale --
+    the previous commit added six and left four of exactly the same kind.
+    """
+    if shape is None:
+        return value
+    if shape.type_name == "list":
+        member = shape.member
+        if isinstance(value, list):
+            return [_cf_conform_to_model(v, member) for v in value]
+        return value
+    members = getattr(shape, "members", {})
+    # A BARE LIST WHERE THE MODEL WANTS A COUNTED STRUCTURE. CloudFormation
+    # writes `Origins: [..]` while the XML shape is {Quantity, Items}; without
+    # this the pass returned the list untouched and never descended into the
+    # entries, so nothing inside an Origin -- CustomOriginConfig's required
+    # ports, S3OriginConfig's identity -- was ever conformed.
+    if (shape.type_name == "structure" and isinstance(value, list)
+            and "Items" in members and members["Items"].type_name == "list"):
+        return _cf_conform_to_model({"Items": value}, shape)
+    if shape.type_name != "structure" or not isinstance(value, dict):
+        return value
+
+    out = {}
+    # A counted block may arrive as a bare list; the renderer handles that, and
+    # so must the ordering pass.
+    for name in members:
+        if name in value:
+            out[name] = _cf_conform_to_model(value[name], members[name])
+    # Anything the model does not know is kept, at the end, rather than dropped:
+    # losing a property silently is worse than emitting one an SDK ignores.
+    for name, item in value.items():
+        if name not in members:
+            out[name] = item
+
+    for req in getattr(shape, "required_members", []):
+        if req in out:
+            continue
+        semantic = _CF_XML_SEMANTIC_DEFAULTS.get((shape.name, req))
+        if semantic is not None:
+            out[req] = semantic(out)
+        else:
+            out[req] = _cf_model_default(members[req])
+    # Re-order once more: the required members were appended above.
+    return {name: out[name] for name in members if name in out} | {
+        name: item for name, item in out.items() if name not in members}
+
+
+def _cf_model_default(shape):
+    """A type-appropriate empty value for a required member CFN never carries."""
+    kind = shape.type_name
+    if kind == "structure":
+        return _cf_conform_to_model({}, shape)
+    if kind == "list":
+        return []
+    if kind == "boolean":
+        return False
+    if kind in ("integer", "long"):
+        return 0
+    return ""
+
+
+def _cf_normalise_distribution_props(value):
+    """Reshape a DistributionConfig property tree into the XML's own shape.
+
+    The two schemas diverge in more places than is obvious; these are the ones
+    reachable from a DistributionConfig:
+
+    - ``CachedMethods`` is a sibling of ``AllowedMethods`` in CloudFormation and
+      a child of it in the XML.
+    - ``GeoRestriction`` wraps its countries in a ``Locations`` property in
+      CloudFormation, while in the XML ``GeoRestriction`` *is* the counted block
+      and the countries are its ``Items``.
+    - six members differ only in spelling -- ``OriginCustomHeaders``,
+      ``OriginSSLProtocols``, and the four acronym cases in ``_CF_DIST_RENAMES``
+      -- which XML does not forgive.
+
+    Everything else maps one to one. The legacy top-level properties (``CNAMEs``,
+    ``CustomOrigin``, ``S3Origin``) have no XML equivalent at all and are left
+    alone rather than half-translated.
+    """
+    if isinstance(value, list):
+        return [_cf_normalise_distribution_props(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    out = {_CF_DIST_RENAMES.get(key, key): _cf_normalise_distribution_props(item)
+           for key, item in value.items()}
+
+    # GeoRestriction: CFN nests the countries under `Locations`, the XML makes
+    # GeoRestriction itself the counted block. Left as-is, the whole restriction
+    # vanished -- botocore parsed the emitted block back as just
+    # {"RestrictionType": ...}, with the required Quantity absent and every
+    # country gone, which is a geo-restricted distribution quietly serving the
+    # world.
+    if "RestrictionType" in out:
+        locations = out.pop("Locations", None)
+        if locations is not None:
+            out["Items"] = (locations.get("Items", locations)
+                            if isinstance(locations, dict) else locations)
+        # Quantity is REQUIRED on GeoRestriction, and `Locations` is optional in
+        # CloudFormation -- `RestrictionType: none` carries none at all -- so the
+        # counted-block renderer never ran and the element went out without one.
+        out.setdefault("Items", [])
+
+    # A bare LIST for these becomes a counted block, and the model pass then
+    # supplies the `Enabled` the XML requires -- it cannot infer "enabled" from a
+    # list it has already turned into Quantity+Items.
+    for key in ("TrustedSigners", "TrustedKeyGroups"):
+        block = out.get(key)
+        if isinstance(block, list):
+            out[key] = {"Enabled": bool(block), "Items": block}
+
+    cached = out.pop("CachedMethods", None)
+    if cached is None:
+        return out
+    allowed = out.get("AllowedMethods")
+    if allowed is None:
+        # CachedMethods without AllowedMethods is not valid on AWS either; keep
+        # it where it was rather than inventing a parent for it.
+        out["CachedMethods"] = cached
+        return out
+    allowed = {"Items": allowed} if isinstance(allowed, list) else dict(allowed)
+    allowed["CachedMethods"] = cached
+    out["AllowedMethods"] = allowed
+    return out
+
+
+def _cf_normalise_distribution_config(props):
+    """Normalise, then conform to the model. The entry point renderers should use.
+
+    Two passes because they are different jobs: the first reshapes where CFN and
+    the XML genuinely disagree (CachedMethods nesting, GeoRestriction.Locations,
+    the acronym renames), and the second -- which needs the schema -- orders the
+    members and fills the ones the XML requires.
+    """
+    return _cf_conform_to_model(_cf_normalise_distribution_props(props),
+                                _cf_model_shape())
+
+
 def _cf_distribution_create(logical_id, props, stack_name):
+    """Provision an AWS::CloudFront::Distribution.
+
+    ``config_xml`` is where a distribution's configuration lives: for one created
+    over the API it is the client's own request body, and every read path
+    re-parses it. Storing an empty string here left a CloudFormation-provisioned
+    distribution with no origins, no cache behaviours and no function
+    associations — readable as a record, useless as a distribution — so the
+    properties are rendered into the same XML the API path would have stored.
+    """
+    from xml.etree.ElementTree import tostring
+
     dist_config = props.get("DistributionConfig", props)
     dist_id = _cf._dist_id()
     arn = f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}"
 
-    origins = dist_config.get("Origins", [])
-    default_cache = dist_config.get("DefaultCacheBehavior", {})
+    config_props = _cf_normalise_distribution_props(dist_config)
+    # Multi-tenant distributions are a separate surface (_distribution_tenants,
+    # _connection_groups); emitting the block without that pairing would only
+    # produce XML nothing reads.
+    config_props.pop("TenantConfig", None)
+    # Required by the XML and absent from the CloudFormation properties, because
+    # CloudFormation's own resource identity plays the same role.
+    config_props.setdefault("CallerReference", dist_id)
+    # Required by the XML shape, optional in CloudFormation -- a CDK
+    # `new Distribution(...)` with no `comment` otherwise emits a config whose
+    # Comment is absent, and boto3's get_distribution KeyErrors on it.
+    config_props.setdefault("Comment", "")
+
+    config_el = _cf_props_to_element("DistributionConfig",
+                                     _cf_conform_to_model(config_props, _cf_model_shape()))
+    config_el.set("xmlns", _cf.NS)
 
     _cf._distributions[dist_id] = {
         "Id": dist_id,
@@ -7411,7 +7726,7 @@ def _cf_distribution_create(logical_id, props, stack_name):
         "DomainName": f"{dist_id}.cloudfront.net",
         "LastModifiedTime": now_iso(),
         "ETag": new_uuid(),
-        "config_xml": "",
+        "config_xml": tostring(config_el, encoding="unicode"),
         "enabled": dist_config.get("Enabled", True),
     }
     _cf._invalidations[dist_id] = []
