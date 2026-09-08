@@ -167,7 +167,25 @@ def _make_build_record(project, build_id, source_version=None):
         },
         "timeoutInMinutes": project.get("timeoutInMinutes", 60),
         "initiator": f"{get_account_id()}/user",
-        "encryptionKey": f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild",
+        # FROM THE PROJECT, which is the override-applied copy by the time this
+        # is called -- not a hardcoded value. Six of the StartBuild overrides
+        # (cache, serviceRole, encryptionKey, queuedTimeoutInMinutes and the two
+        # secondary lists) landed on that copy and then went nowhere, because
+        # this record only carried four fields, so BatchGetBuilds reported the
+        # project's values and the override looked ignored. All six are real
+        # members of the Build shape, checked against botocore's codebuild model.
+        #
+        # `logsConfig` deliberately not among them: a project has a logsConfig,
+        # a build has `logs` (a LogsLocation), so the override is accepted and
+        # shapes the build's configuration without being echoed back here.
+        "encryptionKey": project.get(
+            "encryptionKey",
+            f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild"),
+        "serviceRole": project.get("serviceRole", ""),
+        "cache": project.get("cache", {"type": "NO_CACHE"}),
+        "queuedTimeoutInMinutes": project.get("queuedTimeoutInMinutes", 480),
+        "secondaryArtifacts": project.get("secondaryArtifacts", []),
+        "secondarySources": project.get("secondarySources", []),
     }
 
 
@@ -695,7 +713,11 @@ def _apply_start_build_overrides(project, data):
     """
     effective = copy.deepcopy(project)
 
-    env = effective.setdefault("environment", {})
+    # `or {}`, not just setdefault: CreateProject passes an explicit JSON null
+    # straight through, and setdefault returns that None, so `env[key] = ...`
+    # raised TypeError and answered 500 instead of an API error.
+    env = effective.setdefault("environment", {}) or {}
+    effective["environment"] = env
     for field, key in (("imageOverride", "image"),
                        ("computeTypeOverride", "computeType"),
                        ("environmentTypeOverride", "type"),
@@ -708,12 +730,20 @@ def _apply_start_build_overrides(project, data):
     # Merged by NAME, as AWS does: an override replaces the project's variable
     # of the same name and adds the rest, rather than replacing the whole list.
     if data.get("environmentVariablesOverride") is not None:
-        existing = {v.get("name"): dict(v) for v in env.get("environmentVariables") or []}
+        existing = {v.get("name"): dict(v) for v in env.get("environmentVariables") or []
+                    if v.get("name")}
+        unnamed = [dict(v) for v in env.get("environmentVariables") or [] if not v.get("name")]
         for var in data["environmentVariablesOverride"]:
-            existing[var.get("name")] = dict(var)
-        env["environmentVariables"] = list(existing.values())
+            # A variable with no name cannot participate in a merge BY name --
+            # keyed on None they all collapsed into one. Kept in order instead.
+            if var.get("name"):
+                existing[var["name"]] = dict(var)
+            else:
+                unnamed.append(dict(var))
+        env["environmentVariables"] = list(existing.values()) + unnamed
 
-    source = effective.setdefault("source", {})
+    source = effective.setdefault("source", {}) or {}
+    effective["source"] = source
     for field, key in (("sourceTypeOverride", "type"),
                        ("sourceLocationOverride", "location"),
                        ("buildspecOverride", "buildspec"),
