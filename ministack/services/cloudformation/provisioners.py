@@ -5850,8 +5850,23 @@ def _ec2_flow_log_create(logical_id, props, stack_name):
         "DeliverLogsPermissionArn": props.get("DeliverLogsPermissionArn", ""),
         "MaxAggregationInterval": int(props.get("MaxAggregationInterval", 600)),
         "FlowLogStatus": "ACTIVE",
-        "CreationTime": now_iso(),
+        # The service's own helper, not now_iso(): CreateFlowLogs writes
+        # `_now_ts()` (...T%H:%M:%S.000Z) while now_iso() carries milliseconds,
+        # so a CFN-created and an API-created flow log reported different
+        # timestamp shapes from the same DescribeFlowLogs response.
+        "CreationTime": _ec2._now_ts(),
     }
+    # TAGS, which the service both stores and filters on: CreateFlowLogs parses
+    # TagSpecifications into `_ec2._tags` and DescribeFlowLogs supports
+    # `tag:<key>` filters, so dropping them here made a CDK flow log invisible to
+    # exactly the lookup someone would use to find it. The sibling
+    # _ec2_vpc_endpoint_create already does this.
+    tags = [
+        {"Key": tag.get("Key", ""), "Value": tag.get("Value", "")}
+        for tag in props.get("Tags", [])
+    ]
+    if tags:
+        _ec2._tags[fl_id] = tags
     return fl_id, {"Id": fl_id}
 
 
