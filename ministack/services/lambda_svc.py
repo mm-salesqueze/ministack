@@ -4099,7 +4099,21 @@ try {
     const _p = _u.parse(_ep);
     const msHost = _p.hostname, msPort = parseInt(_p.port || "4566", 10);
     const _local = ["127.0.0.1", "localhost", "host.docker.internal", msHost];
-    const _origReq = _https.request, _origGet = _https.get;
+    const _origReq = _https.request;
+    // ONE agent for the whole process, not one per request. A fresh
+    // keepAlive Agent per call leaks its socket and file descriptors: measured,
+    // 60 rewritten requests took /proc/self/fd from 23 to 143 and held them
+    // after the responses completed. A warm container survives across
+    // invocations, so that climbs until EMFILE.
+    const _msAgent = new _http.Agent({ keepAlive: true });
+    // Host without the port, IPv6 included: "[::1]:8443" must give "::1", where
+    // a plain split(":")[0] gives "[".
+    const _hostOf = function (h) {
+      h = String(h || "");
+      if (h.charAt(0) === "[") { const e = h.indexOf("]"); return e === -1 ? h : h.slice(1, e); }
+      const c = h.indexOf(":");
+      return c === -1 ? h : h.slice(0, c);
+    };
     // Node accepts request(options[, cb]), request(url[, cb]) AND
     // request(url, options[, cb]). Collapsing only the first two and treating
     // argument 2 as the callback makes the three-argument form die on
@@ -4121,13 +4135,25 @@ try {
                      : typeof b === "function" ? b
                      : typeof a === "function" ? a : undefined;
       const options = _norm(a, typeof b === "function" ? null : b);
-      const host = (options.hostname || options.host || "").split(":")[0];
-      if (_local.indexOf(host) !== -1) {
+      const host = _hostOf(options.hostname || options.host);
+      // THE PORT HAS TO MATCH TOO, or this hijacks unrelated traffic. Matching
+      // on host alone meant ANY https request from user code to localhost,
+      // 127.0.0.1 or host.docker.internal -- on any port -- was silently
+      // redirected, in cleartext, to ministack's gateway. A function talking to
+      // its own TLS sidecar on :8443 got ministack's response body instead, and
+      // this shim is injected into every Node Lambda, so that is a lot of
+      // unrelated code to break in service of one callback.
+      //
+      // An ABSENT port is the case worth catching: CDK's ResponseURL is built
+      // against ministack, and https defaults it to 443 when the URL carries
+      // none, which is precisely how the callback goes astray.
+      const port = options.port == null || options.port === "" ? null : parseInt(options.port, 10);
+      if (_local.indexOf(host) !== -1 && (port === null || port === msPort)) {
         options.protocol = "http:";
         options.hostname = msHost;
         options.port = msPort;
         options.host = msHost + ":" + msPort;
-        options.agent = new _http.Agent({ keepAlive: true });
+        options.agent = _msAgent;
         delete options._defaultAgent;
         return _http.request(options, callback);
       }
