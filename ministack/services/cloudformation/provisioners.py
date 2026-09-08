@@ -5411,12 +5411,53 @@ def _cognito_user_pool_identity_provider_update(physical_id, old_props, new_prop
     """
     old_pool_id = old_props.get("UserPoolId", "")
     new_pool_id = new_props.get("UserPoolId", "")
+    new_name = new_props.get("ProviderName") or physical_id
+    new_type = new_props.get("ProviderType")
+    old_type = old_props.get("ProviderType")
+
+    # A NAME OR TYPE CHANGE IS A REPLACEMENT, which AWS marks both as. Both were
+    # silently ignored -- the stack reported UPDATE_COMPLETE while the pool still
+    # held the old provider under the old name and type. Returning a DIFFERENT
+    # physical id is what makes the engine record a replacement and clean up the
+    # predecessor, so this creates the new one and lets that machinery run.
+    if new_name != physical_id or (new_type and old_type and new_type != old_type):
+        created = _cognito_user_pool_identity_provider_create(
+            "Idp", new_props, stack_name)
+        if new_name != physical_id:
+            old_pool = _cognito._user_pools.get(old_pool_id or new_pool_id)
+            if old_pool:
+                old_pool.get("_identity_providers", {}).pop(physical_id, None)
+        return created
+
     if old_pool_id and new_pool_id and old_pool_id != new_pool_id:
+        # CREATE FIRST, THEN REMOVE. Popping the old pool before a create that
+        # can raise left the provider in NEITHER pool, and rollback does not
+        # restore it: the physical id never changed, so stacks.py explicitly
+        # skips the resource ("An in-place change is not reverted here"). That is
+        # permanent, silent loss for a template that merely named a pool wrong.
+        #
+        # AND IDEMPOTENT. A rolled-back update can leave the move already
+        # applied while the template still describes the old pool, so a retry of
+        # the identical change hit the strict create's "already exists" and
+        # wedged a stack that had updated fine. An existing provider of this name
+        # in the TARGET pool is ours -- update it in place instead.
+        target = _cognito._user_pools.get(new_pool_id)
+        if target is None:
+            raise ValueError(
+                f"UserPool {new_pool_id} not found for UserPoolIdentityProvider")
+        existing = target.setdefault("_identity_providers", {}).get(physical_id)
+        if existing is None:
+            _cognito_user_pool_identity_provider_create("Idp", new_props, stack_name)
+        else:
+            for prop in ("ProviderDetails", "AttributeMapping", "IdpIdentifiers"):
+                existing[prop] = new_props.get(prop) or existing.get(prop) or (
+                    {} if prop != "IdpIdentifiers" else [])
+            existing["LastModifiedDate"] = _cognito._now_epoch()
+
         old_pool = _cognito._user_pools.get(old_pool_id)
         if old_pool:
             old_pool.get("_identity_providers", {}).pop(physical_id, None)
-        return _cognito_user_pool_identity_provider_create(
-            physical_id, new_props, stack_name)
+        return physical_id, {}
 
     # Same pool: the mutable properties change in place, which is what AWS's
     # "No interruption" means for them.
@@ -5425,9 +5466,11 @@ def _cognito_user_pool_identity_provider_update(physical_id, old_props, new_prop
     if record is None:
         return _cognito_user_pool_identity_provider_create(
             physical_id, new_props, stack_name)
-    for prop in ("ProviderDetails", "AttributeMapping", "IdpIdentifiers"):
-        if prop in new_props:
-            record[prop] = new_props[prop]
+    # ABSENCE RESETS. `if prop in new_props` left a property removed from the
+    # template at its old value, where AWS resets it.
+    for prop, empty in (("ProviderDetails", {}), ("AttributeMapping", {}),
+                        ("IdpIdentifiers", [])):
+        record[prop] = new_props.get(prop) or empty
     record["LastModifiedDate"] = _cognito._now_epoch()
     return physical_id, {}
 
