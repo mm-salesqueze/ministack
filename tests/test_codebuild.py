@@ -389,6 +389,103 @@ def _s3_zip_source(monkeypatch, entries):
     return {"source": {"type": "S3", "location": "src-bucket/tree.zip"}}
 
 
+def _s3_zip_with_files(monkeypatch, files):
+    """Register a zip of {name: content} in S3 and return a project using it."""
+    import io
+    import zipfile
+
+    from ministack.services import s3 as s3_svc
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    body = buf.getvalue()
+    monkeypatch.setitem(s3_svc._buckets, "src-bucket",
+                        {"objects": {"tree.zip": {"body": body}}})
+    monkeypatch.setattr(s3_svc, "_read_body", lambda b, k, o: body)
+    return {"source": {"type": "S3", "location": "src-bucket/tree.zip"}}
+
+
+def test_archive_buildspec_is_used_when_the_project_has_none(monkeypatch, tmp_path):
+    """The normal AWS case: an S3 source carrying its own buildspec.yml.
+
+    An inline buildspec was MANDATORY, so this failed outright even though the
+    archive's buildspec had been extracted and was sitting there -- which is most
+    of the reason this patch exists.
+    """
+    project = _s3_zip_with_files(monkeypatch, {
+        "buildspec.yml": "version: 0.2\n# FROM-THE-ARCHIVE\n",
+        "ci/build.sh": "#!/bin/sh\n",
+    })
+    src = tmp_path / "src"
+    src.mkdir()
+    codebuild._populate_source_dir(str(src), project, "demo:0001")
+
+    assert (src / "buildspec.yml").read_text().find("FROM-THE-ARCHIVE") != -1
+    assert codebuild._effective_buildspec(str(src), project) is not None
+
+
+def test_inline_buildspec_does_not_clobber_the_archive_one(monkeypatch, tmp_path):
+    """An inline buildspec must not be written over an extracted file."""
+    project = _s3_zip_with_files(monkeypatch, {
+        "buildspec.yml": "version: 0.2\n# FROM-THE-ARCHIVE\n"})
+    project["source"]["buildspec"] = "version: 0.2\n# INLINE\n"
+    src = tmp_path / "src"
+    src.mkdir()
+    codebuild._populate_source_dir(str(src), project, "demo:0002")
+
+    # The archive's file stays on disk; the inline one is used without
+    # overwriting it.
+    assert "FROM-THE-ARCHIVE" in (src / "buildspec.yml").read_text()
+
+
+def test_missing_s3_source_fails_the_build(monkeypatch, tmp_path):
+    """A source that cannot be fetched must FAIL, not report SUCCEEDED.
+
+    Every failure path logged and returned, and the caller ignored the result --
+    so a bucket/key typo produced a green build whose phase report actively
+    asserted DOWNLOAD_SOURCE had succeeded. Real CodeBuild fails that phase.
+    """
+    from ministack.services import s3 as s3_svc
+
+    monkeypatch.setitem(s3_svc._buckets, "src-bucket", {"objects": {}})
+    project = {"source": {"type": "S3", "location": "src-bucket/absent.zip"}}
+    src = tmp_path / "src"
+    src.mkdir()
+
+    assert codebuild._populate_source_dir(str(src), project, "demo:0003") is False
+
+
+def test_oversized_archive_is_refused(monkeypatch, tmp_path):
+    """An uncompressed-size cap, which lambda_svc already has for the same job.
+
+    A 329 KB zip declaring 320 MB uncompressed wrote 320 MB into the workspace in
+    0.2s -- a ~1000:1 ratio, so a few MB of upload exhausts a tmpfs.
+    """
+    import io
+    import zipfile
+
+    from ministack.services import s3 as s3_svc
+
+    # Patch the cap rather than writing half a gigabyte in a test; the ratio is
+    # what matters, and it is ~1000:1.
+    monkeypatch.setattr(codebuild, "_SOURCE_UNZIPPED_LIMIT_BYTES", 8 * 1024 * 1024)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("big.bin", b"\0" * (32 * 1024 * 1024))
+    body = buf.getvalue()
+    monkeypatch.setitem(s3_svc._buckets, "src-bucket",
+                        {"objects": {"tree.zip": {"body": body}}})
+    monkeypatch.setattr(s3_svc, "_read_body", lambda b, k, o: body)
+    project = {"source": {"type": "S3", "location": "src-bucket/tree.zip"}}
+    src = tmp_path / "src"
+    src.mkdir()
+
+    assert codebuild._populate_source_dir(str(src), project, "demo:0004") is False
+    assert not (src / "big.bin").exists()
+
+
 def test_populate_source_dir_restores_the_execute_bit(monkeypatch, tmp_path):
     """extractall drops the mode, so ci/*.sh lands 0644 and fails with exit 126."""
     project = _s3_zip_source(monkeypatch, [
