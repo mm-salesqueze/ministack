@@ -3559,10 +3559,15 @@ def _apigw_method_create(logical_id, props, stack_name):
         # 200 with NO headers: `defaultCorsPreflightOptions` emits a MOCK
         # OPTIONS method whose Access-Control-* values live only in
         # IntegrationResponses[].ResponseParameters. The MOCK executor already
-        # applies them (`_mock_integration_response` maps
-        # method.response.header.* and strips the quotes), so nothing else was
-        # missing — and a browser SPA calling its own API Gateway failed
-        # preflight with nothing in the response to say why.
+        # applies them (`apigateway_v1._invoke_mock_v1` maps
+        # method.response.header.* onto real headers and strips the quotes), so
+        # nothing else was missing — and a browser SPA calling its own API
+        # Gateway failed preflight with nothing in the response to say why.
+        #
+        # Worth knowing on upgrade: a CFN-created MOCK method now answers with
+        # its DECLARED status code instead of a hard-coded 200, so a template
+        # declaring 201 or 204 changes its data-plane status. That is the fix,
+        # but it is a visible change for anyone who was relying on the constant.
         for ir in (integration.get("IntegrationResponses") or []):
             code = str(ir.get("StatusCode", "200"))
             _apigw_v1._put_integration_response(api_id, resource_id, http_method, code, {
