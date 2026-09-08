@@ -1219,31 +1219,59 @@ def _container_reachable_self_host() -> str:
     Our own address on the network the Lambda containers join is reachable by
     construction. It is discovered the way ``rds.py`` and ``ecs.py`` discover
     theirs — by inspecting our own container via ``$HOSTNAME``.
+
+    Only that network, though. ``LAMBDA_DOCKER_NETWORK`` is what puts a spawned
+    container on a user-defined network at all, so with it unset the Lambda joins
+    the default bridge and an address of ours on some other network is not
+    reachable from there. Those cases keep ``host.docker.internal``, which is
+    also wrong but is at least the behaviour that was there before.
     """
     global _self_container_host
     if _self_container_host is not None:
         return _self_container_host
-    _self_container_host = "host.docker.internal"
-    if not _running_in_container():
-        return _self_container_host
-    try:
-        client = _get_docker_client()
-        if client is None:
-            return _self_container_host
-        me = client.containers.get(os.environ.get("HOSTNAME", ""))
-        networks = me.attrs["NetworkSettings"]["Networks"]
-        preferred = LAMBDA_DOCKER_NETWORK or os.environ.get("DOCKER_NETWORK") or ""
-        ordered = ([networks[preferred]] if preferred in networks else [])
-        ordered += [cfg for name, cfg in networks.items() if name != preferred]
-        for cfg in ordered:
-            ip = (cfg or {}).get("IPAddress")
-            if ip:
-                _self_container_host = ip
-                logger.debug("Lambda containers will reach ministack at %s", ip)
-                break
-    except Exception:
-        logger.debug("Could not detect this container's address; Lambda "
-                     "containers will use host.docker.internal")
+
+    # Resolve into a LOCAL, then publish once. Assigning the fallback to the
+    # global first and overwriting it after the Docker round-trip meant two cold
+    # starts racing through here got different answers: this runs under
+    # run_reentrant, so thread A could publish "host.docker.internal", block on
+    # the socket, and thread B spawn its container against that while A went on
+    # to resolve the real address. One of the two functions then had an endpoint
+    # it could not reach.
+    resolved = "host.docker.internal"
+    if _running_in_container():
+        try:
+            client = _get_docker_client()
+            if client is None:
+                raise RuntimeError("no docker client")
+            me = client.containers.get(os.environ.get("HOSTNAME", ""))
+            networks = me.attrs["NetworkSettings"]["Networks"]
+            # ONLY a network the Lambda container will actually join. `network`
+            # is set on the spawn only when LAMBDA_DOCKER_NETWORK is set, so
+            # without it the Lambda lands on the default bridge and our address
+            # on some other user-defined network is unreachable across it --
+            # docker's DOCKER-ISOLATION rules drop that traffic. Falling back to
+            # host.docker.internal is not right either, but it is the previous
+            # behaviour rather than a confidently wrong address.
+            preferred = LAMBDA_DOCKER_NETWORK
+            if not preferred:
+                logger.debug(
+                    "ministack is containerised but LAMBDA_DOCKER_NETWORK is unset, "
+                    "so Lambda containers join the default bridge and cannot be "
+                    "given this container's address; using host.docker.internal")
+            elif preferred in networks:
+                ip = (networks[preferred] or {}).get("IPAddress")
+                if ip:
+                    resolved = ip
+                    logger.debug("Lambda containers will reach ministack at %s", ip)
+            else:
+                logger.debug(
+                    "this container is not on %s, the network Lambda containers "
+                    "join; using host.docker.internal", preferred)
+        except Exception:
+            logger.debug("Could not detect this container's address; Lambda "
+                         "containers will use host.docker.internal")
+
+    _self_container_host = resolved
     return _self_container_host
 
 
@@ -7797,6 +7825,12 @@ def reset():
     import shutil
 
     from ministack.core import lambda_runtime
+
+    # The container-address lookup is memoised for the life of the process, so
+    # a test that monkeypatches _running_in_container or the Docker client
+    # otherwise inherits whatever an earlier test happened to resolve.
+    global _self_container_host
+    _self_container_host = None
 
     _functions.clear()
     _layers.clear()
