@@ -4071,11 +4071,124 @@ def handler(event, context):
 '''
 
 _JS_CTX_ARN_SHIM = '''\
-// MiniStack shim: hand user code the control-plane ARN in its context.
+// MiniStack shim: hand user code the control-plane ARN in its context, and
+// make a CloudFormation custom resource's ResponseURL callback reachable.
 const path = require("path");
 const fs = require("fs");
 const REAL = process.env._MS_REAL_HANDLER || "index.handler";
 const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
+
+// CDK's bundled custom-resource providers build the ResponseURL PUT as
+//     const m = require("url").parse(event.ResponseURL);
+//     require("https").request({hostname: m.hostname, path: m.path, ...})
+// — `hostname` only, so the port is dropped, and https unconditionally. On AWS
+// the ResponseURL is an HTTPS presigned URL on 443 and that is fine; here it is
+// http://<host>:4566/..., so the PUT is dialled at https://<host>:443 and
+// refused, and the resource can only fail by timing out.
+//
+// core/lambda_runtime.py rewrites this for the subprocess worker. A container
+// running AWS's official image never loads that file, so do it here. Rewriting
+// the host too, not just the scheme and port: inside the container `localhost`
+// is the container, and `host.docker.internal` reaches the host only when the
+// gateway port is published beyond loopback. AWS_ENDPOINT_URL is reachable by
+// construction — the SDK in this very container talks to it.
+try {
+  const _u = require("url"), _http = require("http"), _https = require("https");
+  const _ep = process.env.AWS_ENDPOINT_URL || "";
+  if (_ep) {
+    const _p = _u.parse(_ep);
+    const msHost = _p.hostname, msPort = parseInt(_p.port || "4566", 10);
+    const _local = ["127.0.0.1", "localhost", "host.docker.internal", msHost];
+    const _origReq = _https.request;
+    // ONE agent for the whole process, not one per request. A fresh
+    // keepAlive Agent per call leaks its socket and file descriptors: measured,
+    // 60 rewritten requests took /proc/self/fd from 23 to 143 and held them
+    // after the responses completed. A warm container survives across
+    // invocations, so that climbs until EMFILE.
+    const _msAgent = new _http.Agent({ keepAlive: true });
+    // Host without the port, IPv6 included: "[::1]:8443" must give "::1", where
+    // a plain split(":")[0] gives "[".
+    // A port can also ride in `host` ("127.0.0.1:18443") with options.port unset;
+    // _hostOf strips it, so read it back rather than treating such a request as
+    // port-less and redirecting a sidecar call to ministack.
+    const _portOf = function (h) {
+      h = String(h || "");
+      const from = h.charAt(0) === "[" ? h.indexOf("]") + 1 : 0;
+      const i = h.indexOf(":", from);
+      if (i === -1) return null;
+      const p = parseInt(h.slice(i + 1), 10);
+      return isNaN(p) ? null : p;
+    };
+    const _hostOf = function (h) {
+      h = String(h || "");
+      if (h.charAt(0) === "[") { const e = h.indexOf("]"); return e === -1 ? h : h.slice(1, e); }
+      const c = h.indexOf(":");
+      return c === -1 ? h : h.slice(0, c);
+    };
+    // Node accepts request(options[, cb]), request(url[, cb]) AND
+    // request(url, options[, cb]). Collapsing only the first two and treating
+    // argument 2 as the callback makes the three-argument form die on
+    //   TypeError [ERR_INVALID_ARG_TYPE]: The "listener" argument must be of
+    //   type function. Received an instance of Object
+    // which is a confusing way for an unrelated library to break inside a
+    // Lambda, so all three are normalised to a single options object here.
+    const _norm = function (a, b) {
+      let opts, extra = null;
+      if (typeof a === "string") opts = _u.parse(a);
+      else if (a instanceof _u.URL) opts = _u.parse(a.toString());
+      else opts = Object.assign({}, a);
+      if (b && typeof b === "object") extra = b;
+      if (extra) opts = Object.assign(opts, extra);
+      return opts;
+    };
+    _https.request = function (a, b, c) {
+      const callback = typeof c === "function" ? c
+                     : typeof b === "function" ? b
+                     : typeof a === "function" ? a : undefined;
+      const options = _norm(a, typeof b === "function" ? null : b);
+      const host = _hostOf(options.hostname || options.host);
+      // THE PORT HAS TO MATCH TOO, or this hijacks unrelated traffic. Matching
+      // on host alone meant ANY https request from user code to localhost,
+      // 127.0.0.1 or host.docker.internal -- on any port -- was silently
+      // redirected, in cleartext, to ministack's gateway. A function talking to
+      // its own TLS sidecar on :8443 got ministack's response body instead, and
+      // this shim is injected into every Node Lambda, so that is a lot of
+      // unrelated code to break in service of one callback.
+      //
+      // An ABSENT port is the case worth catching: CDK's ResponseURL is built
+      // against ministack, and https defaults it to 443 when the URL carries
+      // none, which is precisely how the callback goes astray.
+      let port = options.port == null || options.port === "" ? null : parseInt(options.port, 10);
+      if (port === null) port = _portOf(options.host);
+      // 443 COUNTS AS PORT-LESS, and leaving it out broke the very thing this
+      // shim exists for. AWS's own cfn-response module builds
+      // {hostname, port: 443, path} from the parsed ResponseURL, so gating on
+      // `port === msPort` alone sent that straight to real TLS: measured,
+      // ECONNREFUSED 127.0.0.1:443, and the custom resource could then only end
+      // by timing out. Nothing is protected by refusing it either -- a TLS
+      // service on loopback:443 inside a Lambda container is not a thing. Any
+      // OTHER explicit port is a deliberate destination and is left alone.
+      if (_local.indexOf(host) !== -1 && (port === null || port === 443 || port === msPort)) {
+        options.protocol = "http:";
+        options.hostname = msHost;
+        options.port = msPort;
+        options.host = msHost + ":" + msPort;
+        options.agent = _msAgent;
+        delete options._defaultAgent;
+        return _http.request(options, callback);
+      }
+      // Rebuilt options, not the original arguments: `a` may be a URL string
+      // whose port we have already resolved, and passing both forms on would
+      // reintroduce the ambiguity this function exists to remove.
+      return _origReq.call(_https, options, callback);
+    };
+    _https.get = function (a, b, c) {
+      const r = _https.request(a, b, c);
+      r.end();
+      return r;
+    };
+  }
+} catch (e) {}
 const dot = REAL.lastIndexOf(".");
 const modPart = REAL.slice(0, dot);
 const fnName = REAL.slice(dot + 1);
@@ -4106,7 +4219,12 @@ exports.handler = async (event, context) => {
 
 
 def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | None:
-    """Drop a context-ARN shim into the code dir; return its handler string.
+    """Drop the runtime shim into the code dir; return its handler string.
+
+    The shim gives user code the control-plane ARN in its context, and — for
+    Node — rewrites the HTTPS-and-no-port ResponseURL callback that CDK's
+    bundled custom-resource providers emit, which the subprocess runtime
+    already rewrites but a container running AWS's official image does not.
 
     Returns None (no shim, original handler runs directly) for runtimes we
     can't wrap, a handler already pointing at the shim's name, or a code dir
