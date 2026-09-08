@@ -164,6 +164,105 @@ def _collect_log_messages(logs, log_group: str) -> list[str]:
     return messages
 
 
+def test_cfn_response_shim_routing_table(tmp_path):
+    """WHICH server receives which request, decided by running the shim in node.
+
+    The shim is injected into every Node Lambda, so its routing decision is the
+    highest-consequence line in the patch and the hardest to reason about from
+    the Python side. This binds a real HTTP listener standing in for ministack's
+    gateway and a real TCP listener standing in for a user sidecar, runs the
+    actual `_JS_CTX_ARN_SHIM` under node, and asserts where each request landed.
+
+    The `port: 443` row is the one that matters most: AWS's own cfn-response
+    module builds {hostname, port: 443, path} from the parsed ResponseURL, so a
+    gate that admits only ministack's own port sends the callback to real TLS and
+    the custom resource can only end by timing out.
+    """
+    import json
+    import re as _re
+    import shutil
+    import socket
+    import subprocess
+    import threading
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not available")
+
+    from ministack.services import lambda_svc
+
+    shim = tmp_path / "shim.js"
+    shim.write_text(lambda_svc._JS_CTX_ARN_SHIM)
+
+    import http.server
+
+    class _Gateway(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):  # noqa: N802
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"GATEWAY")
+        do_GET = do_PUT  # noqa: N815
+        def log_message(self, *a):  # noqa: D102
+            pass
+
+    gateway = http.server.HTTPServer(("127.0.0.1", 0), _Gateway)
+    threading.Thread(target=gateway.serve_forever, daemon=True).start()
+
+    sidecar = socket.socket()
+    sidecar.bind(("127.0.0.1", 0))
+    sidecar.listen(8)
+    sidecar_hits = []
+
+    def _accept():
+        while True:
+            try:
+                conn, _ = sidecar.accept()
+            except OSError:
+                return
+            sidecar_hits.append(1)
+            conn.close()
+
+    threading.Thread(target=_accept, daemon=True).start()
+
+    gw_port = gateway.server_address[1]
+    side_port = sidecar.getsockname()[1]
+
+    driver = tmp_path / "driver.mjs"
+    driver.write_text(f"""
+import https from 'https'; import fs from 'fs';
+const {{createRequire}} = await import('module');
+new Function('require','process','module','exports',
+  fs.readFileSync({json.dumps(str(shim))},'utf8'))(
+  createRequire(import.meta.url), process, {{exports:{{}}}}, {{}});
+const go = (o) => new Promise(res => {{
+  const r = https.request(o, s => {{let b='';s.on('data',d=>b+=d);s.on('end',()=>res('BODY:'+b));}});
+  r.on('error', e => res('ERR:'+e.code)); r.end();
+}});
+const out = {{}};
+out.cfn_response_443 = await go({{hostname:'127.0.0.1', port:443, path:'/cb', method:'PUT'}});
+out.no_port         = await go({{hostname:'127.0.0.1', path:'/cb', method:'PUT'}});
+out.ministack_port  = await go({{hostname:'127.0.0.1', port:{gw_port}, path:'/cb'}});
+out.sidecar_port    = await go({{hostname:'127.0.0.1', port:{side_port}, path:'/x'}});
+console.log(JSON.stringify(out));
+""")
+
+    proc = subprocess.run(
+        [node, str(driver)], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "AWS_ENDPOINT_URL": f"http://127.0.0.1:{gw_port}"})
+    gateway.shutdown()
+    sidecar.close()
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(_re.search(r"\{.*\}", proc.stdout, _re.S).group(0))
+
+    # Ministack's gateway, in every form the ResponseURL can take.
+    assert result["cfn_response_443"] == "BODY:GATEWAY"
+    assert result["no_port"] == "BODY:GATEWAY"
+    assert result["ministack_port"] == "BODY:GATEWAY"
+    # A deliberate port is a deliberate destination: not hijacked.
+    assert result["sidecar_port"] != "BODY:GATEWAY"
+    assert sidecar_hits, "the sidecar request never reached the sidecar"
+
+
 def test_lambda_functions_are_region_scoped():
     east = _regional_client("lambda", "us-east-1")
     west = _regional_client("lambda", "us-west-2")

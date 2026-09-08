@@ -4108,6 +4108,17 @@ try {
     const _msAgent = new _http.Agent({ keepAlive: true });
     // Host without the port, IPv6 included: "[::1]:8443" must give "::1", where
     // a plain split(":")[0] gives "[".
+    // A port can also ride in `host` ("127.0.0.1:18443") with options.port unset;
+    // _hostOf strips it, so read it back rather than treating such a request as
+    // port-less and redirecting a sidecar call to ministack.
+    const _portOf = function (h) {
+      h = String(h || "");
+      const from = h.charAt(0) === "[" ? h.indexOf("]") + 1 : 0;
+      const i = h.indexOf(":", from);
+      if (i === -1) return null;
+      const p = parseInt(h.slice(i + 1), 10);
+      return isNaN(p) ? null : p;
+    };
     const _hostOf = function (h) {
       h = String(h || "");
       if (h.charAt(0) === "[") { const e = h.indexOf("]"); return e === -1 ? h : h.slice(1, e); }
@@ -4147,8 +4158,17 @@ try {
       // An ABSENT port is the case worth catching: CDK's ResponseURL is built
       // against ministack, and https defaults it to 443 when the URL carries
       // none, which is precisely how the callback goes astray.
-      const port = options.port == null || options.port === "" ? null : parseInt(options.port, 10);
-      if (_local.indexOf(host) !== -1 && (port === null || port === msPort)) {
+      let port = options.port == null || options.port === "" ? null : parseInt(options.port, 10);
+      if (port === null) port = _portOf(options.host);
+      // 443 COUNTS AS PORT-LESS, and leaving it out broke the very thing this
+      // shim exists for. AWS's own cfn-response module builds
+      // {hostname, port: 443, path} from the parsed ResponseURL, so gating on
+      // `port === msPort` alone sent that straight to real TLS: measured,
+      // ECONNREFUSED 127.0.0.1:443, and the custom resource could then only end
+      // by timing out. Nothing is protected by refusing it either -- a TLS
+      // service on loopback:443 inside a Lambda container is not a thing. Any
+      // OTHER explicit port is a deliberate destination and is left alone.
+      if (_local.indexOf(host) !== -1 && (port === null || port === 443 || port === msPort)) {
         options.protocol = "http:";
         options.hostname = msHost;
         options.port = msPort;
