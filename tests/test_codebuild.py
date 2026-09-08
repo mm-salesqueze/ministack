@@ -364,6 +364,77 @@ def test_start_build_is_metadata_only_by_default(monkeypatch):
     assert calls == []
 
 
+def _s3_zip_source(monkeypatch, entries):
+    """Register a zip in the S3 store and return a project pointing at it.
+
+    `entries` is a list of (name, create_system, mode) so a test can hand
+    _populate_source_dir a deliberately hostile archive.
+    """
+    import io
+    import zipfile
+
+    from ministack.services import s3 as s3_svc
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, create_system, mode in entries:
+            info = zipfile.ZipInfo(name)
+            info.create_system = create_system
+            info.external_attr = mode << 16
+            zf.writestr(info, "x")
+    body = buf.getvalue()
+    monkeypatch.setitem(s3_svc._buckets, "src-bucket",
+                        {"objects": {"tree.zip": {"body": body}}})
+    monkeypatch.setattr(s3_svc, "_read_body", lambda b, k, o: body)
+    return {"source": {"type": "S3", "location": "src-bucket/tree.zip"}}
+
+
+def test_populate_source_dir_restores_the_execute_bit(monkeypatch, tmp_path):
+    """extractall drops the mode, so ci/*.sh lands 0644 and fails with exit 126."""
+    project = _s3_zip_source(monkeypatch, [
+        ("ci/run.sh", 3, 0o100755),
+        ("README.md", 3, 0o100644),
+    ])
+    src = tmp_path / "src"
+    src.mkdir()
+    codebuild._populate_source_dir(str(src), project, "demo:0001")
+
+    assert (src / "ci" / "run.sh").stat().st_mode & 0o777 == 0o755
+    assert (src / "README.md").stat().st_mode & 0o777 == 0o644
+
+
+def test_populate_source_dir_cannot_chmod_outside_the_source_dir(monkeypatch, tmp_path):
+    """A zip entry named `../victim` must not reach a file outside source_dir.
+
+    extractall sanitises the entry name, but joining the RAW name did not, and
+    os.path.join discards its prefix on an absolute name -- so this loop was an
+    arbitrary chmod on any file the server could reach, setuid included.
+    """
+    victim = tmp_path / "victim.txt"
+    victim.write_text("x")
+    victim.chmod(0o644)
+
+    project = _s3_zip_source(monkeypatch, [
+        ("../victim.txt", 3, 0o104777),      # traversal + setuid
+        (str(victim), 3, 0o104777),          # absolute path
+    ])
+    src = tmp_path / "src"
+    src.mkdir()
+    codebuild._populate_source_dir(str(src), project, "demo:0001")
+
+    assert victim.stat().st_mode & 0o7777 == 0o644
+
+
+def test_populate_source_dir_ignores_non_unix_mode_bits(monkeypatch, tmp_path):
+    """external_attr is only a Unix mode when create_system is 3."""
+    project = _s3_zip_source(monkeypatch, [("notes.txt", 0, 0o100777)])
+    src = tmp_path / "src"
+    src.mkdir()
+    codebuild._populate_source_dir(str(src), project, "demo:0001")
+
+    assert (src / "notes.txt").stat().st_mode & 0o777 != 0o777
+
+
 def test_execute_build_records_phases_from_agent_log(monkeypatch, tmp_path):
     container = _FakeContainer([
         "Phase complete: INSTALL State: SUCCEEDED",
