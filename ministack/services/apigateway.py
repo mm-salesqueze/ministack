@@ -1737,15 +1737,34 @@ def find_api_scope(api_id):
     wherever it succeeds; only the case that used to 404 resolves differently.
     """
     account_id = get_account_id()
-    fallback = None
+    others = []
     for (stored_account, region, stored_api_id), _api in _apis.all_items():
         if stored_api_id != api_id:
             continue
         if stored_account == account_id:
             return stored_account, region
-        if fallback is None:
-            fallback = (stored_account, region)
-    return fallback
+        if (stored_account, region) not in others:
+            others.append((stored_account, region))
+
+    # ONLY WHEN IT IS UNAMBIGUOUS. The whole justification for looking outside
+    # the ambient account is that an api id names exactly one API -- and that
+    # stopped being guaranteed the moment `ms-custom-id` uniqueness was correctly
+    # scoped per account, because two accounts pinning the same id is then normal
+    # and legal. Returning the first match made the winner dict insertion order:
+    # a request silently served by whichever account deployed first, with no
+    # error and no way to address the other.
+    #
+    # Refusing is the honest answer. The caller turns None into 404, and the log
+    # line names both candidates, which is a diagnosable failure rather than a
+    # wrong success. Signing the request still reaches either one, because the
+    # ambient-account branch above takes precedence.
+    if len(others) > 1:
+        logger.warning(
+            "execute-api id %s exists in more than one account (%s); refusing to "
+            "guess. Sign the request, or give the APIs distinct ms-custom-id tags.",
+            api_id, ", ".join(f"{a}/{r}" for a, r in others))
+        return None
+    return others[0] if others else None
 
 
 def api_id_taken_in_account(api_id):
