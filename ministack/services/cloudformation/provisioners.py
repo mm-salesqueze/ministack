@@ -5838,15 +5838,21 @@ def _ecs_cluster_capacity_providers_create(logical_id, props, stack_name):
     The strategy list is PascalCase in CloudFormation and camelCase on the API,
     so it is translated here rather than stored as-is — a strategy the service's
     own API cannot read is the defect this would otherwise reproduce.
+
+    `Cluster` is resolved through the service's own `_resolve_cluster_name`,
+    because the API documents it as "short name or full ARN" and CDK naturally
+    writes the ARN: `Cluster: !GetAtt Cluster.Arn` used to roll the stack back
+    with "cluster not found" while the identical ARN through
+    PutClusterCapacityProviders returned 200.
     """
-    cluster = props.get("Cluster", "")
+    cluster = _ecs._resolve_cluster_name(props.get("Cluster", ""))
     record = _ecs._clusters.get(cluster)
     if record is None:
         raise ValueError("AWS::ECS::ClusterCapacityProviderAssociations: "
-                         f"cluster {cluster!r} not found")
+                         f"cluster {props.get('Cluster', '')!r} not found")
     record["capacityProviders"] = props.get("CapacityProviders", []) or []
     record["defaultCapacityProviderStrategy"] = [
-        {k[:1].lower() + k[1:]: v for k, v in item.items()}
+        {_cfn_to_camel(k): v for k, v in item.items()}
         for item in (props.get("DefaultCapacityProviderStrategy") or [])
     ]
     return cluster, {}
