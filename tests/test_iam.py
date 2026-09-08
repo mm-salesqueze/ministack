@@ -38,6 +38,16 @@ def test_ecr_describe_repositories_authorises_every_name():
     single = _json.dumps({"repositoryNames": ["solo"]}).encode()
     assert ecr_additional_checks("POST", "/", headers, single, {}) == []
 
+    # Keyed on the FIELD, not one action: BatchGetRepositoryScanningConfiguration
+    # takes the same plural and shares the names[0] branch, so an action-keyed
+    # guard left it authorising the first repository only.
+    scanning = {"x-amz-target":
+                "AmazonEC2ContainerRegistry_V20150921.BatchGetRepositoryScanningConfiguration"}
+    assert [arn for _a, arn in ecr_additional_checks("POST", "/", scanning, body, {})] == [
+        "arn:aws:ecr:us-east-1:000000000000:repository/bar",
+        "arn:aws:ecr:us-east-1:000000000000:repository/baz",
+    ]
+
 
 def test_iam_role_user(iam):
     iam.create_role(

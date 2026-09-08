@@ -329,11 +329,18 @@ def ecr_additional_checks(method: str, path: str, headers: dict, body: bytes,
     question: a policy allowing repository/foo and explicitly denying
     repository/bar let a call naming both through, where AWS denies it.
     """
-    action = extract_iam_action("ecr", method, path, headers, body, query_params)
-    if action != "ecr:DescribeRepositories":
-        return []
+    # KEYED ON THE PAYLOAD, not on one action name. `repositoryNames` is not
+    # unique to DescribeRepositories -- BatchGetRepositoryScanningConfiguration
+    # takes it too, and shares the same `names[0]` branch in
+    # extract_resource_arn, so an action-keyed guard left that one authorising
+    # the first repository only while a comment claimed it was covered. Reading
+    # the field instead makes this correct for every plural-name ECR action,
+    # including ones added later.
     names = _safe_json_field(body, "repositoryNames")
     if not isinstance(names, list) or len(names) < 2:
+        return []
+    action = extract_iam_action("ecr", method, path, headers, body, query_params)
+    if not action:
         return []
     from ministack.core.responses import get_account_id, get_region
 
@@ -1001,8 +1008,10 @@ def extract_resource_arn(service: str, method: str, path: str,
         if not name:
             # DescribeRepositories takes `repositoryNames` — a LIST — where the
             # repository-scoped ECR calls take the singular `repositoryName`.
-            # (BatchGetRepositoryScanningConfiguration takes the plural too, and
-            # is covered by the same branch.) Reading only the singular made
+            # BatchGetRepositoryScanningConfiguration takes the plural too, and
+            # shares this branch; `ecr_additional_checks` keys on the field
+            # rather than the action so both authorise every name. Reading only
+            # the singular made
             # this resolve to "*", which matches no repository-scoped policy, so
             # the call was denied against a policy that plainly allows it.
             #
