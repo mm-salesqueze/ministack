@@ -2500,17 +2500,40 @@ def _api_protocol(api_id: str) -> str | None:
 
 
 def _api_owner(api_id: str):
-    """Return (protocolType, owner_account_id, owner_region) for an API or None."""
-    # WebSocket dispatch arrives before we know the owning account or region, so
-    # scan every account+region slot directly.
+    """Return (protocolType, owner_account_id, owner_region) for an API or None.
+
+    WebSocket dispatch arrives before we know the owning account or region, so
+    this scans every account+region slot -- but with the SAME two rules
+    `find_api_scope` uses, because this is the resolver for the whole WebSocket
+    surface and it was answering differently from the HTTP one.
+
+    THE AMBIENT ACCOUNT WINS. A signed connect to your own API was served by
+    another account's API of the same id, and `handle_websocket` then scopes the
+    entire session to the owner it returns -- so $connect, $disconnect and every
+    route Lambda ran in the wrong account.
+
+    AND AMBIGUITY IS REFUSED rather than guessed. Two accounts holding one id is
+    legal now that `ms-custom-id` uniqueness is per account, so returning the
+    first match made the winner dict insertion order.
+    """
+    account_id = get_account_id()
+    others = []
     for (acct, region, key), api in _apis.all_items():
-        if key == api_id:
-            return (
-                api.get("protocolType", "HTTP"),
-                acct,
-                region,
-            )
-    return None
+        if key != api_id:
+            continue
+        entry = (api.get("protocolType", "HTTP"), acct, region)
+        if acct == account_id:
+            return entry
+        if entry not in others:
+            others.append(entry)
+
+    if len(others) > 1:
+        logger.warning(
+            "WebSocket api id %s exists in more than one account (%s); refusing to "
+            "guess. Sign the request, or give the APIs distinct ms-custom-id tags.",
+            api_id, ", ".join(f"{a}/{r}" for _p, a, r in others))
+        return None
+    return others[0] if others else None
 
 
 def _match_ws_route(api_id: str, route_key: str):
