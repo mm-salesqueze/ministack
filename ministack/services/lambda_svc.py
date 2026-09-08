@@ -1202,15 +1202,108 @@ def _normalize_endpoint_url(value: str) -> str:
     return f"http://{host}"
 
 
+_self_container_host: str | None = None
+
+
+def _container_reachable_self_host() -> str:
+    """The address a spawned Lambda container can reach this server on.
+
+    ``host.docker.internal`` is the right answer only when ministack runs on the
+    host: it resolves to the Docker bridge gateway, which reaches a published
+    port. When ministack is itself containerised on a user-defined network that
+    breaks twice over — the gateway is not this server, and a port published to
+    loopback (``-p 127.0.0.1:4566:4566``, the safe default) is not on the
+    gateway either. The Lambda then dies on every SDK call with
+    ``ECONNREFUSED 172.17.0.1``.
+
+    Our own address on the network the Lambda containers join is reachable by
+    construction. It is discovered the way ``rds.py`` and ``ecs.py`` discover
+    theirs — by inspecting our own container via ``$HOSTNAME``.
+
+    Only that network, though. ``LAMBDA_DOCKER_NETWORK`` is what puts a spawned
+    container on a user-defined network at all, so with it unset the Lambda joins
+    the default bridge and an address of ours on some other network is not
+    reachable from there. Those cases keep ``host.docker.internal``, which is
+    also wrong but is at least the behaviour that was there before.
+    """
+    global _self_container_host
+    if _self_container_host is not None:
+        return _self_container_host
+
+    # Resolve into a LOCAL, then publish once. Assigning the fallback to the
+    # global first and overwriting it after the Docker round-trip meant two cold
+    # starts racing through here got different answers: this runs under
+    # run_reentrant, so thread A could publish "host.docker.internal", block on
+    # the socket, and thread B spawn its container against that while A went on
+    # to resolve the real address. One of the two functions then had an endpoint
+    # it could not reach.
+    resolved = "host.docker.internal"
+    if _running_in_container():
+        try:
+            client = _get_docker_client()
+            if client is None:
+                raise RuntimeError("no docker client")
+            me = client.containers.get(os.environ.get("HOSTNAME", ""))
+            networks = me.attrs["NetworkSettings"]["Networks"]
+            # ONLY a network the Lambda container will actually join. `network`
+            # is set on the spawn only when LAMBDA_DOCKER_NETWORK is set, so
+            # without it the Lambda lands on the default bridge and our address
+            # on some other user-defined network is unreachable across it --
+            # docker's DOCKER-ISOLATION rules drop that traffic. Falling back to
+            # host.docker.internal is not right either, but it is the previous
+            # behaviour rather than a confidently wrong address.
+            # Unset means the spawned container joins the DEFAULT BRIDGE, and if
+            # we are on it too then our bridge address is reachable by
+            # construction -- the same argument that justifies using our address
+            # on a named network. Declining it sent every SDK call to
+            # host.docker.internal, which a loopback-published port does not
+            # answer: measured, the bridge IP works and host.docker.internal is
+            # refused, so this was rejecting the one address that functions in
+            # the commonest containerised setup.
+            preferred = LAMBDA_DOCKER_NETWORK or "bridge"
+            if preferred in networks:
+                ip = (networks[preferred] or {}).get("IPAddress")
+                if ip:
+                    resolved = ip
+                    logger.debug("Lambda containers will reach ministack at %s", ip)
+            else:
+                logger.debug(
+                    "this container is not on %s, the network Lambda containers "
+                    "join; using host.docker.internal", preferred)
+        except Exception:
+            logger.debug("Could not detect this container's address; Lambda "
+                         "containers will use host.docker.internal")
+
+    _self_container_host = resolved
+    return _self_container_host
+
+
 def _rewrite_host_for_container(url: str) -> str:
-    """Rewrite a ``localhost``/``127.0.0.1`` URL to ``host.docker.internal`` so a
-    Docker Lambda container can reach ministack on the host. Explicitly
-    configured hosts (e.g. a Docker-network name) are left untouched."""
+    """Rewrite a ``localhost``/``127.0.0.1`` URL to an address a Docker Lambda
+    container can reach ministack on. Explicitly configured hosts (e.g. a
+    Docker-network name) are left untouched.
+
+    THE PORT GOES WITH THE HOST when the target is our own container address. A
+    published port belongs to the host's namespace: `-p 127.0.0.1:14566:4566`
+    means the host answers on 14566 and the container answers on 4566, so
+    carrying 14566 across to the container IP produces an address nothing is
+    listening on. `host.docker.internal:14566` was right precisely because it
+    stayed in the host namespace; swapping the host without the port is what
+    broke it. Verified against a live daemon: the container IP answers on the
+    internal port and refuses the published one.
+    """
     if not url:
         return url
+    target = _container_reachable_self_host()
+    internal = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     for host in ("localhost", "127.0.0.1"):
-        url = url.replace(f"://{host}:", "://host.docker.internal:")
-        url = url.replace(f"://{host}/", "://host.docker.internal/")
+        if target == "host.docker.internal":
+            # Still the host's namespace: keep whatever port was published.
+            url = url.replace(f"://{host}:", f"://{target}:")
+        else:
+            url = re.sub(rf"://{re.escape(host)}:\d+", f"://{target}:{internal}", url)
+        url = url.replace(f"://{host}/", f"://{target}:{internal}/"
+                          if target != "host.docker.internal" else f"://{target}/")
     return url
 
 
@@ -4368,8 +4461,9 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             config.get("FunctionName", "?"),
         )
     # AWS_ENDPOINT_URL set *after* function env so it always points at ministack.
-    # Replace localhost/127.0.0.1 with host.docker.internal so the container
-    # can reach the host where ministack is running.
+    # Both branches resolve to an address the container can actually reach —
+    # the host gateway when ministack runs on the host, our own address on the
+    # Lambda network when ministack is itself containerised.
     endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
     if not endpoint:
         endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
@@ -4377,9 +4471,8 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         endpoint = _normalize_endpoint_url(env_vars.get("LOCALSTACK_HOSTNAME", ""))
     if not endpoint:
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        endpoint = f"http://host.docker.internal:{port}"
+        endpoint = f"http://{_container_reachable_self_host()}:{port}"
     else:
-        # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
 
@@ -7869,6 +7962,12 @@ def reset():
     import shutil
 
     from ministack.core import lambda_runtime
+
+    # The container-address lookup is memoised for the life of the process, so
+    # a test that monkeypatches _running_in_container or the Docker client
+    # otherwise inherits whatever an earlier test happened to resolve.
+    global _self_container_host
+    _self_container_host = None
 
     _functions.clear()
     _layers.clear()
