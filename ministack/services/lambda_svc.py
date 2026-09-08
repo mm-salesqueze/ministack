@@ -1252,13 +1252,16 @@ def _container_reachable_self_host() -> str:
             # docker's DOCKER-ISOLATION rules drop that traffic. Falling back to
             # host.docker.internal is not right either, but it is the previous
             # behaviour rather than a confidently wrong address.
-            preferred = LAMBDA_DOCKER_NETWORK
-            if not preferred:
-                logger.debug(
-                    "ministack is containerised but LAMBDA_DOCKER_NETWORK is unset, "
-                    "so Lambda containers join the default bridge and cannot be "
-                    "given this container's address; using host.docker.internal")
-            elif preferred in networks:
+            # Unset means the spawned container joins the DEFAULT BRIDGE, and if
+            # we are on it too then our bridge address is reachable by
+            # construction -- the same argument that justifies using our address
+            # on a named network. Declining it sent every SDK call to
+            # host.docker.internal, which a loopback-published port does not
+            # answer: measured, the bridge IP works and host.docker.internal is
+            # refused, so this was rejecting the one address that functions in
+            # the commonest containerised setup.
+            preferred = LAMBDA_DOCKER_NETWORK or "bridge"
+            if preferred in networks:
                 ip = (networks[preferred] or {}).get("IPAddress")
                 if ip:
                     resolved = ip
@@ -1278,13 +1281,29 @@ def _container_reachable_self_host() -> str:
 def _rewrite_host_for_container(url: str) -> str:
     """Rewrite a ``localhost``/``127.0.0.1`` URL to an address a Docker Lambda
     container can reach ministack on. Explicitly configured hosts (e.g. a
-    Docker-network name) are left untouched."""
+    Docker-network name) are left untouched.
+
+    THE PORT GOES WITH THE HOST when the target is our own container address. A
+    published port belongs to the host's namespace: `-p 127.0.0.1:14566:4566`
+    means the host answers on 14566 and the container answers on 4566, so
+    carrying 14566 across to the container IP produces an address nothing is
+    listening on. `host.docker.internal:14566` was right precisely because it
+    stayed in the host namespace; swapping the host without the port is what
+    broke it. Verified against a live daemon: the container IP answers on the
+    internal port and refuses the published one.
+    """
     if not url:
         return url
     target = _container_reachable_self_host()
+    internal = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
     for host in ("localhost", "127.0.0.1"):
-        url = url.replace(f"://{host}:", f"://{target}:")
-        url = url.replace(f"://{host}/", f"://{target}/")
+        if target == "host.docker.internal":
+            # Still the host's namespace: keep whatever port was published.
+            url = url.replace(f"://{host}:", f"://{target}:")
+        else:
+            url = re.sub(rf"://{re.escape(host)}:\d+", f"://{target}:{internal}", url)
+        url = url.replace(f"://{host}/", f"://{target}:{internal}/"
+                          if target != "host.docker.internal" else f"://{target}/")
     return url
 
 
