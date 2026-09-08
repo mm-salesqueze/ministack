@@ -2550,8 +2550,7 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
     # Same unwrap path as HTTP (#409): APIGW integrationUri is the wrapper form
     # that nests the Lambda ARN between /functions/ and /invocations.
     lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
-    _parsed_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
-    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+    func_data, func_config, _func_name = lambda_svc._get_func_record_for_ref_in_scope(
         lambda_ref,
         account_id=account_id,
         region=region,
