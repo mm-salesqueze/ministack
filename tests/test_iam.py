@@ -5,6 +5,34 @@ import pytest
 from botocore.exceptions import ClientError
 
 
+@pytest.mark.parametrize("method,path,action", [
+    ("GET",    "/2021-10-31/functions/fn/url",  "lambda:GetFunctionUrlConfig"),
+    ("PUT",    "/2021-10-31/functions/fn/url",  "lambda:UpdateFunctionUrlConfig"),
+    ("DELETE", "/2021-10-31/functions/fn/url",  "lambda:DeleteFunctionUrlConfig"),
+    ("POST",   "/2021-10-31/functions/fn/url",  "lambda:CreateFunctionUrlConfig"),
+    ("GET",    "/2021-10-31/functions/fn/urls", "lambda:ListFunctionUrlConfigs"),
+])
+def test_lambda_function_url_actions(method, path, action):
+    """/url and /urls are DIFFERENT operations.
+
+    The plural fell through to the catch-all and was charged as
+    lambda:GetFunction, so a policy granting exactly ListFunctionUrlConfigs
+    denied the call it names. Operation names and IAM action names are equal for
+    all five of these (botocore lambda/2015-03-31).
+    """
+    from ministack.core.iam_actions import extract_iam_action
+
+    assert extract_iam_action("lambda", method, path, {}, b"", {}) == action
+
+
+def test_lambda_function_url_resource_is_the_function():
+    from ministack.core.iam_actions import extract_resource_arn
+
+    arn = extract_resource_arn("lambda", "GET", "/2021-10-31/functions/fn/urls",
+                               {}, b"", {}, "us-east-1", "000000000000")
+    assert arn == "arn:aws:lambda:us-east-1:000000000000:function:fn"
+
+
 def test_iam_role_user(iam):
     iam.create_role(
         RoleName="test-role",
