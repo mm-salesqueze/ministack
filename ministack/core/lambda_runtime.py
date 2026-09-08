@@ -744,22 +744,53 @@ function patchAwsSdk() {
 
   // Patch https.request for bundled SDK
   const origHttpsReq = https.request;
-  https.request = function(options, callback) {
-    if (typeof options === "string") options = url.parse(options);
-    else if (options instanceof url.URL) options = url.parse(options.toString());
-    else options = Object.assign({}, options);
+  // ONE agent for the process, not one per request. A fresh keepAlive Agent per
+  // call leaks its socket and file descriptors, and a warm worker survives many
+  // invocations, so it climbs until EMFILE.
+  const msAgent = new http.Agent({ keepAlive: true });
+  // Host without the port, IPv6 included: "[::1]:8443" must give "::1", where a
+  // plain split(":")[0] gives "[". `options.host` may legitimately carry
+  // "host:port" while options.port is unset, so the port has to be read back
+  // from it rather than assumed absent.
+  const hostOf = function (h) {
+    h = String(h || "");
+    if (h.charAt(0) === "[") { const e = h.indexOf("]"); return e === -1 ? h : h.slice(1, e); }
+    const c = h.indexOf(":");
+    return c === -1 ? h : h.slice(0, c);
+  };
+  const portOf = function (h) {
+    h = String(h || "");
+    const from = h.charAt(0) === "[" ? h.indexOf("]") + 1 : 0;
+    const i = h.indexOf(":", from);
+    if (i === -1) return null;
+    const p = parseInt(h.slice(i + 1), 10);
+    return isNaN(p) ? null : p;
+  };
+  // ALL THREE SIGNATURES. Node accepts request(options[, cb]), request(url[, cb])
+  // and request(url, options[, cb]); collapsing only the first two and treating
+  // argument 2 as the callback made the three-argument form die on
+  //   TypeError [ERR_INVALID_ARG_TYPE]: The "listener" argument must be of type
+  //   function. Received an instance of Object
+  // which is a confusing way for an unrelated library to break inside a Lambda.
+  https.request = function(a, b, c) {
+    const callback = typeof c === "function" ? c
+                   : typeof b === "function" ? b
+                   : typeof a === "function" ? a : undefined;
+    let options;
+    if (typeof a === "string") options = url.parse(a);
+    else if (a instanceof url.URL) options = url.parse(a.toString());
+    else options = Object.assign({}, a);
+    if (b && typeof b === "object") options = Object.assign(options, b);
 
-    const host = options.hostname || options.host || "";
+    const host = hostOf(options.hostname || options.host);
     if (host.endsWith(".amazonaws.com") || host.endsWith(".amazonaws.com.cn")) {
       options.protocol = "http:";
       options.hostname = msHost;
       options.host = msHost + ":" + msPort;
       options.port = msPort;
       options.path = options.path || "/";
-      if (options.agent instanceof https.Agent) {
-        options.agent = new http.Agent({ keepAlive: true });
-      } else if (options.agent === undefined) {
-        options.agent = new http.Agent({ keepAlive: true });
+      if (options.agent instanceof https.Agent || options.agent === undefined) {
+        options.agent = msAgent;
       }
       delete options._defaultAgent;
       return http.request(options, callback);
@@ -767,13 +798,27 @@ function patchAwsSdk() {
 
     // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
     // cfn-response.js calls https.request unconditionally for the ResponseURL
-    // PUT, and also drops the port when constructing options.  Intercept here
-    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
-    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
+    // PUT, and also drops the port when constructing options. Intercept here so
+    // the PUT reaches Ministack's HTTP server on msPort, not port 443.
+    //
+    // GATED ON THE PORT, and the port is REWRITTEN. `options.port || msPort`
+    // kept an explicit 443 and then dialled http at it, so AWS's own
+    // cfn-response module -- which builds {hostname, port: 443} from the parsed
+    // ResponseURL -- got ECONNREFUSED and the custom resource could only end by
+    // timing out. And matching on host alone hijacked unrelated traffic: any
+    // https call from user code to loopback on ANY port was redirected, in
+    // cleartext, so a function talking to its own TLS sidecar on :8443 got
+    // ministack's response body. 443 and a missing port are ministack; any other
+    // explicit port is a deliberate destination and is left alone.
+    const localPort = options.port == null || options.port === ""
+      ? portOf(options.host) : parseInt(options.port, 10);
+    if ((host === "127.0.0.1" || host === "localhost" || host === msHost)
+        && (localPort === null || localPort === 443 || localPort === msPort)) {
       options.protocol = "http:";
-      options.port = options.port || msPort;
-      options.host = host + ":" + options.port;
-      options.agent = new http.Agent({ keepAlive: true });
+      options.port = msPort;
+      options.hostname = msHost;
+      options.host = msHost + ":" + msPort;
+      options.agent = msAgent;
       delete options._defaultAgent;
       return http.request(options, callback);
     }
