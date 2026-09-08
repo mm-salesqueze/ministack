@@ -8121,6 +8121,110 @@ Outputs:
 """
 
 
+def _cloudfront_shape(name="DistributionConfig"):
+    import gzip
+    import json as _json
+    import os as _os
+
+    import botocore
+    from botocore.model import ServiceModel
+
+    root = _os.path.join(_os.path.dirname(botocore.__file__), "data", "cloudfront")
+    version = sorted(_os.listdir(root))[-1]
+    path = _os.path.join(root, version, "service-2.json")
+    raw = gzip.open(path + ".gz").read() if _os.path.exists(path + ".gz") else open(path, "rb").read()
+    return ServiceModel(_json.loads(raw)).shape_for(name)
+
+
+def _validate_against_shape(element, shape, path="DistributionConfig"):
+    """Check an emitted element against the CloudFront model, by NAME.
+
+    Round-trip parsing is not an oracle for this. botocore takes the children of
+    a non-flattened <Items> POSITIONALLY and never compares the child element
+    name, so `<Items><TOTALLY_WRONG>US</TOTALLY_WRONG></Items>` parses exactly
+    like `<Items><Location>US</Location></Items>` -- measured. Every item tag in
+    _CF_LIST_ITEM_TAGS could be wrong and a parse-and-compare test would still
+    pass. This walks the tree instead and asserts three things a strict
+    (name-matching) SDK cares about: every element is a declared member, every
+    list child carries the member's own locationName, and every required member
+    is present.
+    """
+    errors = []
+    if shape.type_name == "structure":
+        members = shape.members
+        for child in element:
+            if child.tag not in members:
+                errors.append(f"{path}: <{child.tag}> is not a member")
+                continue
+            errors += _validate_against_shape(child, members[child.tag], f"{path}.{child.tag}")
+        for req in getattr(shape, "required_members", []):
+            if element.find(req) is None:
+                errors.append(f"{path}: required member <{req}> is missing")
+    elif shape.type_name == "list":
+        want = shape.member.serialization.get("name") or shape.member.name
+        for child in element:
+            if child.tag != want:
+                errors.append(f"{path}: list item is <{child.tag}>, model says <{want}>")
+            else:
+                errors += _validate_against_shape(child, shape.member, f"{path}.{want}")
+    return errors
+
+
+def _assert_valid_distribution_config(props):
+    from ministack.services.cloudformation.provisioners import (
+        _cf_normalise_distribution_props,
+        _cf_props_to_element,
+    )
+
+    element = _cf_props_to_element("DistributionConfig",
+                                   _cf_normalise_distribution_props(props))
+    errors = _validate_against_shape(element, _cloudfront_shape())
+    assert not errors, "\n".join(errors)
+
+
+def test_distribution_config_is_structurally_valid_for_a_full_template():
+    """A representative CDK-shaped distribution emits a model-valid document."""
+    _assert_valid_distribution_config({
+        "Enabled": True,
+        "Comment": "cdk",
+        "CallerReference": "ref-1",
+        "IPV6Enabled": False,
+        "Origins": [{
+            "Id": "o1", "DomainName": "b.s3.amazonaws.com",
+            "OriginCustomHeaders": [{"HeaderName": "X-A", "HeaderValue": "1"}],
+            "CustomOriginConfig": {"OriginProtocolPolicy": "https-only",
+                                   "OriginSSLProtocols": ["TLSv1.2"]},
+        }],
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o1", "ViewerProtocolPolicy": "redirect-to-https",
+            "AllowedMethods": ["GET", "HEAD"], "CachedMethods": ["GET", "HEAD"],
+            "TrustedKeyGroups": ["kg-1"],
+        },
+        "Restrictions": {"GeoRestriction": {"RestrictionType": "whitelist",
+                                            "Locations": ["US", "CA"]}},
+        "ViewerCertificate": {"AcmCertificateArn": "arn:aws:acm:us-east-1:1:certificate/x",
+                              "SslSupportMethod": "sni-only",
+                              "MinimumProtocolVersion": "TLSv1.2_2021"},
+        "Logging": {"Bucket": "logs.s3.amazonaws.com", "Prefix": "cf/"},
+        "OriginGroups": {"Quantity": 1, "Items": [{
+            "Id": "og1",
+            "FailoverCriteria": {"StatusCodes": {"Quantity": 1, "Items": [500]}},
+            "Members": {"Quantity": 2, "Items": [{"OriginId": "o1"}, {"OriginId": "o2"}]},
+        }]},
+    })
+
+
+def test_distribution_geo_restriction_without_locations_still_carries_quantity():
+    """`RestrictionType: none` carries no Locations, and Quantity is required."""
+    _assert_valid_distribution_config({
+        "Enabled": True, "Comment": "c", "CallerReference": "ref-2",
+        "Origins": [{"Id": "o1", "DomainName": "d"}],
+        "DefaultCacheBehavior": {"TargetOriginId": "o1",
+                                 "ViewerProtocolPolicy": "allow-all"},
+        "Restrictions": {"GeoRestriction": {"RestrictionType": "none"}},
+    })
+
+
 def _parse_distribution_config(props):
     """Render CFN DistributionConfig props and parse them back with botocore.
 

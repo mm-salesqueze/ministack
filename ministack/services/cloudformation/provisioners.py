@@ -7489,9 +7489,40 @@ def _cf_normalise_distribution_props(value):
     # {"RestrictionType": ...}, with the required Quantity absent and every
     # country gone, which is a geo-restricted distribution quietly serving the
     # world.
-    locations = out.pop("Locations", None)
-    if locations is not None and "RestrictionType" in out:
-        out["Items"] = locations.get("Items", locations) if isinstance(locations, dict) else locations
+    if "RestrictionType" in out:
+        locations = out.pop("Locations", None)
+        if locations is not None:
+            out["Items"] = (locations.get("Items", locations)
+                            if isinstance(locations, dict) else locations)
+        # Quantity is REQUIRED on GeoRestriction, and `Locations` is optional in
+        # CloudFormation -- `RestrictionType: none` carries none at all -- so the
+        # counted-block renderer never ran and the element went out without one.
+        out.setdefault("Items", [])
+
+    # MEMBERS THE XML REQUIRES AND CLOUDFORMATION DOES NOT CARRY. Each is
+    # required in the CloudFront model and simply absent from the CFN schema, so
+    # nothing downstream can supply them and a strict parser sees an invalid
+    # document (a Python consumer just KeyErrors).
+    #
+    #   Enabled -- for TrustedSigners/TrustedKeyGroups, CloudFormation expresses
+    #   "enabled" as the list being non-empty; for Logging, as the block being
+    #   present at all. Both have to become an explicit flag here.
+    for key in ("TrustedSigners", "TrustedKeyGroups"):
+        block = out.get(key)
+        # CloudFormation writes these as a bare LIST of ids, which the counted
+        # block renderer turns into Quantity+Items -- so the dict form is the
+        # rarer one and checking only for it missed every real template.
+        if isinstance(block, list):
+            out[key] = {"Enabled": bool(block), "Items": block}
+        elif isinstance(block, dict) and "Enabled" not in block:
+            block["Enabled"] = bool(block.get("Items"))
+    if isinstance(out.get("Logging"), dict):
+        out["Logging"].setdefault("Enabled", True)
+    # CustomOriginConfig's ports are optional in CloudFormation (it documents the
+    # same 80/443 defaults) and required in the XML.
+    if isinstance(out.get("CustomOriginConfig"), dict):
+        out["CustomOriginConfig"].setdefault("HTTPPort", 80)
+        out["CustomOriginConfig"].setdefault("HTTPSPort", 443)
 
     cached = out.pop("CachedMethods", None)
     if cached is None:
@@ -7532,6 +7563,10 @@ def _cf_distribution_create(logical_id, props, stack_name):
     # Required by the XML and absent from the CloudFormation properties, because
     # CloudFormation's own resource identity plays the same role.
     config_props.setdefault("CallerReference", dist_id)
+    # Required by the XML shape, optional in CloudFormation -- a CDK
+    # `new Distribution(...)` with no `comment` otherwise emits a config whose
+    # Comment is absent, and boto3's get_distribution KeyErrors on it.
+    config_props.setdefault("Comment", "")
 
     config_el = _cf_props_to_element("DistributionConfig", config_props)
     config_el.set("xmlns", _cf.NS)
