@@ -3177,10 +3177,199 @@ def test_cfn_auto_name_dynamodb_follows_aws_pattern(cfn, ddb):
     _wait_stack(cfn, "cfn-autoname-ddb")
 
 
+@pytest.fixture
+def ddb_provisioner_scope():
+    """Ambient account/region for calling provisioners directly, cleaned up after.
+
+    These tests exercise the provisioner functions rather than the HTTP surface,
+    because the behaviour under test is which region KEYS the table store holds —
+    something no single API response reveals.
+    """
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import dynamodb as _ddb
+
+    account = "000000000000"
+    set_request_account_id(account)
+    set_request_region("us-east-1")
+    before = set(_ddb._tables._data.keys())
+    try:
+        yield account
+    finally:
+        for key in set(_ddb._tables._data.keys()) - before:
+            _ddb._tables._data.pop(key, None)
+
+
+def _global_table_props(name="reg", replicas=(), **extra):
+    props = {
+        "TableName": name,
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "BillingMode": "PAY_PER_REQUEST",
+        "Replicas": [{"Region": r} for r in replicas],
+    }
+    props.update(extra)
+    return props
+
+
+def _replica_regions(account, name):
+    """Which region keys the table store currently holds for this table name."""
+    from ministack.services import dynamodb as _ddb
+    return sorted(r for (a, r, k) in list(_ddb._tables._data.keys())
+                  if a == account and k == name)
+
+
+def test_global_table_replicas_are_registered_and_share_items(ddb_provisioner_scope):
+    """A replica region serves the SAME table object, so a write is visible in both.
+
+    Lambda@Edge is the case that finds this: it runs wherever the viewer is and
+    reads from its own region, so the same request succeeded from one edge
+    location and 502'd from another.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import dynamodb as _ddb
+    account = ddb_provisioner_scope
+
+    P._ddb_global_table_create("T", _global_table_props(replicas=("us-east-1", "eu-west-1")), "stk")
+    assert _replica_regions(account, "reg") == ["eu-west-1", "us-east-1"]
+
+    east = _ddb._tables.get_scoped(account, "us-east-1", "reg")
+    west = _ddb._tables.get_scoped(account, "eu-west-1", "reg")
+    assert east is west
+
+
+def test_global_table_update_adds_and_removes_replica_regions(ddb_provisioner_scope):
+    """Replicas were only ever written by create, so an update did nothing.
+
+    Adding a region left reads there answering ResourceNotFoundException — the
+    error the resource exists to avoid — and removing one left the key in place,
+    where the delete handler (which reads the CURRENT props) never unregistered
+    it either, so it outlived the stack as a table nothing could delete.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    account = ddb_provisioner_scope
+
+    two = _global_table_props(replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_create("T", two, "stk")
+
+    three = _global_table_props(replicas=("us-east-1", "eu-west-1", "ap-south-1"))
+    P._ddb_global_table_update("reg", two, three, "stk")
+    assert _replica_regions(account, "reg") == ["ap-south-1", "eu-west-1", "us-east-1"]
+
+    one = _global_table_props(replicas=("us-east-1",))
+    P._ddb_global_table_update("reg", three, one, "stk")
+    assert _replica_regions(account, "reg") == ["us-east-1"]
+
+    P._ddb_global_table_delete("reg", one)
+    assert _replica_regions(account, "reg") == []
+
+
+def test_global_table_does_not_clobber_another_table_of_the_same_name(ddb_provisioner_scope):
+    """Registering a replica must not eat an unrelated table in that region.
+
+    eu-west-1 already has `sessions`; a us-east-1 stack declaring a GlobalTable
+    also called `sessions` with a eu-west-1 replica used to replace that object
+    and every item in it, with no error and no stack event.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import dynamodb as _ddb
+    account = ddb_provisioner_scope
+
+    stranger = {"TableName": "sessions", "items": {"MINE": 1}}
+    _ddb._tables.set_scoped(account, "eu-west-1", "sessions", stranger)
+
+    P._ddb_global_table_create(
+        "S", _global_table_props(name="sessions", replicas=("us-east-1", "eu-west-1")), "stk")
+
+    assert _ddb._tables.get_scoped(account, "eu-west-1", "sessions") is stranger
+
+
+def test_global_table_does_not_clobber_a_stranger_on_update_or_delete(ddb_provisioner_scope):
+    """The stranger guard has to hold on EVERY path, not just create.
+
+    The first version keyed the exemption on the region name -- "we registered
+    eu-west-1 last time, so it is ours" -- so create refused to touch an unrelated
+    table and the very next update overwrote it, and dropping the region from
+    Replicas popped it outright. Ownership is by object identity now, and this
+    walks create -> update -> remove-region -> delete against a stranger.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import dynamodb as _ddb
+    account = ddb_provisioner_scope
+
+    stranger = {"TableName": "sessions", "items": {"MINE": 1}}
+    _ddb._tables.set_scoped(account, "eu-west-1", "sessions", stranger)
+
+    two = _global_table_props(name="sessions", replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_create("S", two, "stk")
+    assert _ddb._tables.get_scoped(account, "eu-west-1", "sessions") is stranger
+
+    changed = dict(two, DeletionProtectionEnabled=True)
+    P._ddb_global_table_update("sessions", two, changed, "stk")
+    assert _ddb._tables.get_scoped(account, "eu-west-1", "sessions") is stranger
+    assert stranger["items"] == {"MINE": 1}
+
+    one = _global_table_props(name="sessions", replicas=("us-east-1",))
+    P._ddb_global_table_update("sessions", changed, one, "stk")
+    assert _ddb._tables.get_scoped(account, "eu-west-1", "sessions") is stranger
+
+    P._ddb_global_table_delete("sessions", one)
+    assert _ddb._tables.get_scoped(account, "eu-west-1", "sessions") is stranger
+
+
+def test_global_table_rename_leaves_no_keys_under_the_old_name(ddb_provisioner_scope):
+    """A rename must move the replica keys, not leave a set under the old name.
+
+    Everything in the update handler is keyed on the NEW name, and the delete
+    handler reads the current props -- so nothing ever looked under the old one
+    and its replica keys outlived the stack holding the orphaned pre-rename
+    object. For an auto-named GlobalTable every replacement is a rename, so it
+    always leaked.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    account = ddb_provisioner_scope
+
+    v1 = _global_table_props(name="reg-v1", replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_create("T", v1, "stk")
+    assert _replica_regions(account, "reg-v1") == ["eu-west-1", "us-east-1"]
+
+    v2 = _global_table_props(name="reg-v2", replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_update("reg-v1", v1, v2, "stk")
+
+    assert _replica_regions(account, "reg-v1") == []
+    assert _replica_regions(account, "reg-v2") == ["eu-west-1", "us-east-1"]
+
+    P._ddb_global_table_delete("reg-v2", v2)
+    assert _replica_regions(account, "reg-v2") == []
+
+
+def test_global_table_update_never_drops_the_source_region(ddb_provisioner_scope):
+    """Removing the source region from Replicas must not delete the table.
+
+    It is not a replica -- it is the table. Popping it left the next update with
+    nothing to find, so `_ddb_update` built a fresh empty one and repointed the
+    surviving replicas at it: every item gone, and no replacement event to show
+    for it.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import dynamodb as _ddb
+    ddb_provisioner_scope
+
+    two = _global_table_props(replicas=("us-east-1", "eu-west-1"))
+    P._ddb_global_table_create("T", two, "stk")
+    _ddb._tables.get("reg").setdefault("items", {})["k"] = {"pk": {"S": "1"}}
+
+    without_source = _global_table_props(replicas=("eu-west-1",))
+    P._ddb_global_table_update("reg", two, without_source, "stk")
+
+    table = _ddb._tables.get("reg")
+    assert table is not None
+    assert table.get("items")
+
+
 def test_cfn_dynamodb_global_table_pay_per_request(cfn, ddb):
     """AWS::DynamoDB::GlobalTable with PAY_PER_REQUEST billing — the common
-    CDK TableV2 default. Replicas is required by CFN; locally it's ignored.
-    Regression for issue #596."""
+    CDK TableV2 default. Regression for issue #596. (Replicas is honoured now;
+    see the replica unit tests below.)"""
     template = {
         "AWSTemplateFormatVersion": "2010-09-09",
         "Resources": {
