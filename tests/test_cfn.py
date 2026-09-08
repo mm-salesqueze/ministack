@@ -8150,16 +8150,42 @@ def _validate_against_shape(element, shape, path="DistributionConfig"):
     is present.
     """
     errors = []
+    if element.attrib and path != "DistributionConfig":
+        # xmlns on the root is expected; anywhere else an attribute means we
+        # invented one, and CloudFront's shapes carry none.
+        errors.append(f"{path}: unexpected attributes {sorted(element.attrib)}")
+
     if shape.type_name == "structure":
         members = shape.members
+        order = list(members)
+        seen = []
         for child in element:
             if child.tag not in members:
                 errors.append(f"{path}: <{child.tag}> is not a member")
                 continue
+            if child.tag in seen:
+                errors.append(f"{path}: <{child.tag}> appears more than once")
+            seen.append(child.tag)
             errors += _validate_against_shape(child, members[child.tag], f"{path}.{child.tag}")
+        # ORDER MATTERS. CloudFront's REST-XML structures are sequence-typed, so
+        # a member in the wrong position is invalid however correct its name --
+        # and a name-matching SDK is entitled to reject the document. Parsing it
+        # back with botocore does not show this, which is why it needs asserting.
+        ranked = [order.index(t) for t in seen]
+        if ranked != sorted(ranked):
+            errors.append(f"{path}: members out of model order: {seen} "
+                          f"(model: {[m for m in order if m in seen]})")
         for req in getattr(shape, "required_members", []):
-            if element.find(req) is None:
+            found = element.find(req)
+            if found is None:
                 errors.append(f"{path}: required member <{req}> is missing")
+            elif (found.text is None and len(found) == 0
+                  and members[req].type_name in ("boolean", "integer", "long")):
+                # Blank text is only malformed for a member that must PARSE.
+                # A required string may legitimately be empty -- CloudFront's
+                # Comment is required and "" is a valid value, so flagging
+                # <Comment/> was the check being wrong, not the document.
+                errors.append(f"{path}: required member <{req}> is empty")
     elif shape.type_name == "list":
         want = shape.member.serialization.get("name") or shape.member.name
         for child in element:
@@ -8170,16 +8196,132 @@ def _validate_against_shape(element, shape, path="DistributionConfig"):
     return errors
 
 
-def _assert_valid_distribution_config(props):
+def _assert_quantities_match_items(element, path="DistributionConfig"):
+    """Every counted block's <Quantity> must equal the number of <Items> children.
+
+    A Quantity that disagrees with the list is the failure this whole area is
+    about, and no parser will tell you -- botocore reports both fields verbatim.
+    """
+    errors = []
+    quantity = element.find("Quantity")
+    items = element.find("Items")
+    if quantity is not None:
+        actual = len(items) if items is not None else 0
+        try:
+            declared = int((quantity.text or "0").strip())
+        except ValueError:
+            errors.append(f"{path}.Quantity: {quantity.text!r} is not a number")
+            declared = None
+        if declared is not None and declared != actual:
+            errors.append(f"{path}: Quantity says {declared}, Items holds {actual}")
+    for child in element:
+        errors += _assert_quantities_match_items(child, f"{path}.{child.tag}")
+    return errors
+
+
+def _assert_valid_distribution_config(props, through_create=False):
+    """Validate the emitted DistributionConfig against the CloudFront model.
+
+    `through_create=True` goes via `_cf_distribution_create`, which is where
+    CallerReference, Comment and the xmlns come from -- the normaliser alone does
+    not produce them, so a test that only calls the normaliser cannot police the
+    very defaults the patch is named for.
+    """
+    from xml.etree.ElementTree import fromstring
+
     from ministack.services.cloudformation.provisioners import (
         _cf_normalise_distribution_props,
         _cf_props_to_element,
     )
 
-    element = _cf_props_to_element("DistributionConfig",
-                                   _cf_normalise_distribution_props(props))
+    if through_create:
+        from ministack.services import cloudfront as _cf
+        from ministack.services.cloudformation import provisioners as P
+
+        dist_id, _attrs = P._cf_distribution_create(
+            "Dist", {"DistributionConfig": props}, "stk")
+        record = _cf._distributions.get(dist_id)
+        assert record is not None, "create did not store a distribution"
+        xml = record.get("config_xml")
+        assert xml, "create stored an empty config_xml"
+        element = fromstring(xml)
+        # The stored document carries CloudFront's xmlns, so ElementTree reports
+        # every tag as "{ns}Name". Strip it -- the namespace itself is asserted
+        # separately below, and the model uses bare member names.
+        assert element.tag.endswith("DistributionConfig")
+        assert "cloudfront.amazonaws.com/doc/" in element.tag, "xmlns is missing"
+        for node in element.iter():
+            if "}" in node.tag:
+                node.tag = node.tag.split("}", 1)[1]
+    else:
+        from ministack.services.cloudformation.provisioners import (
+            _cf_normalise_distribution_config,
+        )
+        element = _cf_props_to_element("DistributionConfig",
+                                       _cf_normalise_distribution_config(props))
+
     errors = _validate_against_shape(element, _cloudfront_shape())
+    errors += _assert_quantities_match_items(element)
     assert not errors, "\n".join(errors)
+
+
+def test_distribution_config_is_valid_through_the_create_path():
+    """The defaults the patch is named for come from _cf_distribution_create.
+
+    Both structural tests hand-supplied Comment and CallerReference, so neither
+    ever exercised the code that actually produces them -- deleting those
+    defaults left every test green while breaking every consumer.
+    """
+    _assert_valid_distribution_config({
+        "Enabled": True,
+        "Origins": [{"Id": "o1", "DomainName": "b.s3.amazonaws.com"}],
+        "DefaultCacheBehavior": {"TargetOriginId": "o1",
+                                 "ViewerProtocolPolicy": "allow-all"},
+    }, through_create=True)
+
+
+def test_distribution_forwarded_values_carries_its_required_cookies():
+    """ForwardedValues.Cookies is required by the XML and optional in CFN.
+
+    Every pre-CachePolicy template -- Terraform's aws_cloudfront_distribution,
+    CDK v1-style, AWS's own samples -- writes ForwardedValues: {QueryString:
+    false}, and boto3 then KeyErrors on Cookies exactly as it did on Comment.
+    """
+    _assert_valid_distribution_config({
+        "Enabled": True, "Comment": "c", "CallerReference": "r",
+        "Origins": [{"Id": "o1", "DomainName": "d"}],
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o1", "ViewerProtocolPolicy": "allow-all",
+            "ForwardedValues": {"QueryString": False},
+        },
+    })
+
+
+def test_distribution_s3_origin_config_carries_its_required_identity():
+    """S3OriginConfig.OriginAccessIdentity is required; CFN omits it for OAC."""
+    _assert_valid_distribution_config({
+        "Enabled": True, "Comment": "c", "CallerReference": "r",
+        "Origins": [{"Id": "o1", "DomainName": "b.s3.amazonaws.com",
+                     "S3OriginConfig": {}}],
+        "DefaultCacheBehavior": {"TargetOriginId": "o1",
+                                 "ViewerProtocolPolicy": "allow-all"},
+    })
+
+
+def test_distribution_empty_counted_block_still_emits_items():
+    """`Items` is required on Origins/AllowedMethods/CachedMethods and friends.
+
+    Omitting it for an empty list produced Quantity with no Items, which is
+    invalid however sensible it looks.
+    """
+    _assert_valid_distribution_config({
+        "Enabled": True, "Comment": "c", "CallerReference": "r",
+        "Origins": [{"Id": "o1", "DomainName": "d"}],
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o1", "ViewerProtocolPolicy": "allow-all",
+            "AllowedMethods": [],
+        },
+    })
 
 
 def test_distribution_config_is_structurally_valid_for_a_full_template():
