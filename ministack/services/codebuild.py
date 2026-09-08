@@ -210,9 +210,25 @@ EXECUTE_BUILDS = os.environ.get("MINISTACK_CODEBUILD_EXECUTE", "0").lower() in (
 # a real choice, so it is not configurable.
 AGENT_IMAGE = "public.ecr.aws/codebuild/local-builds:latest"
 
-# Internal scratch space for the source/artifacts/env files handed to the
-# agent container; not an AWS concept, so not configurable.
-WORKSPACE = "/tmp/ministack-codebuild"
+# Internal scratch space for the source/artifacts/env files handed to the agent
+# container. Not an AWS concept, but configurable, because the default location
+# is a bad one on many hosts: `/tmp` is a tmpfs on most Linux installs --
+# commonly a few GiB -- and a workspace holds the whole unpacked source plus its
+# output, so a handful of builds of a real repo fill it and the next one dies on
+# "zip I/O error: No space left on device" with gigabytes free on the actual disk.
+#
+# WHEN MINISTACK IS ITSELF CONTAINERISED this must resolve to the SAME path on
+# the host and in the container, because the agent bind-mounts it into the build
+# container and the daemon reads that path on the host:
+#
+#     -v /var/run/docker.sock:/var/run/docker.sock \
+#     -v $CODEBUILD_WORKSPACE_DIR:$CODEBUILD_WORKSPACE_DIR \
+#     -e CODEBUILD_WORKSPACE_DIR=$CODEBUILD_WORKSPACE_DIR
+#
+# Set it to an empty string and it is not "unset" -- os.environ.get returns ""
+# and every workspace path becomes relative to the server's cwd, which is why
+# `_reap_workspace` refuses to delete anything it cannot place inside this root.
+WORKSPACE = os.environ.get("CODEBUILD_WORKSPACE_DIR", "/tmp/ministack-codebuild")
 
 # Extra `docker run` flags for the AGENT container, with the same syntax and the
 # same parser as LAMBDA_DOCKER_FLAGS.
@@ -391,6 +407,91 @@ def _timeout_seconds(project):
     return max(1, minutes) * 60
 
 
+def _workspace_dirname(build_id):
+    """A single path segment for this build, whatever its project is called.
+
+    THE NAME IS ATTACKER-CONTROLLED. A build id is "<project>:<uuid>", and
+    CreateProject only checks the name is non-empty where AWS enforces
+    [A-Za-z0-9][A-Za-z0-9-_]{1,254} -- so `../../etc` is accepted and every use
+    of this path escaped WORKSPACE, not just the delete: os.makedirs, the env
+    file (which carries AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY), the
+    buildspec, and the zip extraction.
+
+    Bounding the deletion alone was the wrong half. Everything that touches the
+    workspace derives from this one value, so sanitising here is what actually
+    makes the containment true -- and it stays true for any writer added later,
+    which a check bolted onto the reaper does not.
+    """
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", build_id).lstrip(".") or "build"
+
+
+def _reap_workspace(workdir, build_id, keep_artifacts=True):
+    """Remove a finished build's workspace.
+
+    Nothing else ever removed these: one directory per build, each holding the
+    whole unpacked source, kept until the process was thrown away. WORKSPACE
+    defaults under /tmp, a tmpfs on many Linux installs, so a handful of builds
+    of a real repo fill it and the next one dies on "No space left on device"
+    with gigabytes free on the actual disk.
+
+    `artifacts/` SURVIVES BY DEFAULT, and that is the whole subtlety. On AWS the
+    workspace is disposable because the artifacts have already gone to S3 --
+    MiniStack uploads nothing, so this directory is the only copy that exists,
+    and reaping it wholesale silently destroyed the build output.
+
+    Keeping it unconditionally does not solve the problem this exists for,
+    though: `os.rmdir` below then never succeeds, because the build directory
+    always holds `artifacts/`, so one directory per build accumulates forever --
+    200 no-op builds leave 200 directories, measured. The caller passes
+    `keep_artifacts=False` when the project declares NO_ARTIFACTS, which is the
+    default and the dominant case: there is no output by definition, so the
+    directory is always empty and keeping it buys nothing.
+
+    A project that does declare artifacts still keeps them, and that retention is
+    still unbounded. The real fix is to upload them to the declared S3 location
+    the way CodeBuild does, after which nothing needs retaining at all; until
+    then this is the honest half -- never destroy an output, never hoard an empty
+    directory.
+
+    Bounded to WORKSPACE, belt and braces. `_workspace_dirname` already reduces
+    the build id to one safe path segment, so `workdir` cannot point outside;
+    this re-checks with realpath because an empty CODEBUILD_WORKSPACE_DIR makes
+    every path relative to the server's cwd, and because a delete is the one
+    operation whose blast radius is worth confirming twice.
+    """
+    if os.environ.get("CODEBUILD_KEEP_WORKSPACE", "") == "1":
+        return
+
+    root = os.path.realpath(WORKSPACE) if WORKSPACE else ""
+    target = os.path.realpath(workdir)
+    if not root or target == root or os.path.commonpath([root, target]) != root:
+        logger.warning(
+            "Build %s: refusing to remove workspace %s -- it is not inside %r",
+            build_id, target, WORKSPACE)
+        return
+
+    import shutil
+    doomed = ("src", "env") if keep_artifacts else ("src", "env", "artifacts")
+    for name in doomed:
+        path = os.path.join(target, name)
+        if not os.path.exists(path):
+            continue
+        # No ignore_errors: it would make the handler below dead code and swallow
+        # the one thing worth reporting, which is a workspace that will not go.
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            logger.warning("Build %s: could not remove %s: %s", build_id, path, exc)
+
+    # The build directory itself, once nothing is left in it. With artifacts kept
+    # this necessarily fails, which is the point -- their parent has to survive
+    # too; it only becomes reachable when keep_artifacts is False.
+    try:
+        os.rmdir(target)
+    except OSError:
+        pass
+
+
 def _execute_build(build_id, project):
     """Run a build through the CodeBuild local agent; update its record live."""
     build = _builds.get(build_id)
@@ -402,7 +503,11 @@ def _execute_build(build_id, project):
         return
 
     env = project.get("environment", {}) or {}
-    workdir = os.path.join(WORKSPACE, build_id.replace(":", "_"))
+    workdir = os.path.join(WORKSPACE, _workspace_dirname(build_id))
+    # NO_ARTIFACTS means there is no output by definition, so the artifacts
+    # directory is always empty and keeping it only leaks an inode per build.
+    keep_artifacts = ((project.get("artifacts") or {}).get("type") or
+                      "NO_ARTIFACTS").upper() != "NO_ARTIFACTS"
     source_dir = os.path.join(workdir, "src")
     artifacts_dir = os.path.join(workdir, "artifacts")
     env_dir = os.path.join(workdir, "env")
@@ -415,6 +520,13 @@ def _execute_build(build_id, project):
         if not buildspec.strip():
             logger.error("Build %s has no inline buildspec to execute", build_id)
             _finish_build(build, "FAILED")
+            # Reap here too: this return is inside the outer `try`, whose only
+            # handler is the `except` below, so it never reaches the `finally`
+            # that normally does this. And it is the worst one to miss -- the
+            # source has already been unpacked by the time we get here, so the
+            # path that leaves a whole repo behind was exactly the path that
+            # skipped cleanup.
+            _reap_workspace(workdir, build_id, keep_artifacts)
             return
 
         buildspec_path = os.path.join(source_dir, "buildspec.yml")
@@ -462,6 +574,9 @@ def _execute_build(build_id, project):
     except Exception:
         logger.exception("Failed to start build %s", build_id)
         _finish_build(build, "FAULT")
+        # Same reason as above: this handler returns without reaching the
+        # `finally` further down, and the source is already on disk.
+        _reap_workspace(workdir, build_id, keep_artifacts)
         return
 
     try:
@@ -546,6 +661,7 @@ def _execute_build(build_id, project):
             container.remove(force=True, v=True)
         except Exception:
             pass
+        _reap_workspace(workdir, build_id, keep_artifacts)
 
 
 # ---------------------------------------------------------------------------
