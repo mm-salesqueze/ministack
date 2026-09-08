@@ -1470,26 +1470,75 @@ def _ddb_global_table_create(logical_id, props, stack_name):
     # meaning in one process is replication LAG, not replication.
     #
     # Only the table itself is shared. Tags, TTL and PITR settings stay
-    # per-region, which is where the emulator's fidelity ends.
+    # per-region -- and note the TTL reaper walks the shared object, so a TTL
+    # enabled in one region expires items for every replica. That, and the fact
+    # that PERSIST_STATE serialises each region key to its own JSON copy (so
+    # replicas diverge across a restart), is where the emulator's fidelity ends.
     table = _dynamodb._tables.get(name)
     if table is not None:
-        account = get_account_id()
-        for replica in (props.get("Replicas") or []):
-            region = replica.get("Region") if isinstance(replica, dict) else None
-            if region:
-                _dynamodb._tables.set_scoped(account, region, name, table)
+        _ddb_register_replicas(name, table, _ddb_replica_regions(props))
 
     return name, attrs
 
 
-def _ddb_global_table_delete(physical_id, props):
-    # Every region the create registered, or a replica outlives the stack that
-    # declared it and the next deploy finds a table it did not create.
-    account = get_account_id()
+def _ddb_replica_regions(props) -> list:
+    """The regions a GlobalTable's `Replicas` names, in order, ignoring junk."""
+    out = []
     for replica in (props.get("Replicas") or []):
         region = replica.get("Region") if isinstance(replica, dict) else None
-        if region:
-            _dynamodb._tables.pop_scoped(account, region, physical_id, None)
+        if region and region not in out:
+            out.append(region)
+    return out
+
+
+def _ddb_register_replicas(name, table, regions, claimed=()) -> None:
+    """Register one table object under each replica region's key.
+
+    REFUSES to overwrite a DIFFERENT table that already sits at that key. Without
+    the check this silently destroyed unrelated data: eu-west-1 already has a
+    `sessions` table, a us-east-1 stack declares a GlobalTable also called
+    `sessions` with a eu-west-1 replica, and that table object plus every item in
+    it is replaced -- no error, no stack event, nothing in the template naming the
+    thing that was lost. Skipping and logging is the conservative half of the
+    trade: the replica is missing, which is the failure this patch set out to fix,
+    but it is a visible one and it does not eat someone else's table.
+
+    `claimed` are regions this resource already registered on a previous pass, so
+    the key there is ours to repoint. That distinction matters on a REPLACEMENT:
+    the table object changes identity, so the key holds our own orphaned
+    predecessor -- which the guard above would otherwise mistake for a stranger's
+    table and refuse to touch, stranding the replica on the orphan.
+    """
+    account = get_account_id()
+    for region in regions:
+        existing = _dynamodb._tables.get_scoped(account, region, name)
+        if existing is not None and existing is not table and region not in claimed:
+            logger.warning(
+                "GlobalTable %s: region %s already holds a different table of that "
+                "name; leaving it alone rather than replacing it. That replica will "
+                "not share items.", name, region)
+            continue
+        _dynamodb._tables.set_scoped(account, region, name, table)
+
+
+def _ddb_unregister_replicas(name, regions, table=None) -> None:
+    """Drop the replica keys, leaving a table this stack did not create in place."""
+    account = get_account_id()
+    for region in regions:
+        existing = _dynamodb._tables.get_scoped(account, region, name)
+        if existing is None or (table is not None and existing is not table):
+            continue
+        _dynamodb._tables.pop_scoped(account, region, name, None)
+
+
+def _ddb_global_table_delete(physical_id, props):
+    # Every region the create registered, or a replica outlives the stack that
+    # declared it and the next deploy finds a table it did not create. This is
+    # only correct because `_ddb_global_table_update` reconciles the replica set
+    # -- if an update could leave a stale region behind, the props here would no
+    # longer name it and it would survive the stack as an undeletable phantom.
+    table = _dynamodb._tables.get(physical_id)
+    _ddb_unregister_replicas(physical_id, _ddb_replica_regions(props), table)
     _ddb_delete(physical_id, props)
 
 
@@ -8490,7 +8539,36 @@ def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
                  "WriteOnDemandThroughputSettings", "ReadOnDemandThroughputSettings",
                  "WriteProvisionedThroughputSettings", "ReadProvisionedThroughputSettings"):
         translated.pop(prop, None)
-    return _ddb_update(physical_id, old_props, translated, stack_name)
+    name, attrs = _ddb_update(physical_id, old_props, translated, stack_name)
+
+    # RECONCILE THE REPLICA SET. Stripping `Replicas` above and stopping there
+    # meant the region keys were only ever written by create, so:
+    #
+    #   * adding a region to an existing GlobalTable did nothing at all — reads
+    #     in the new region still answered `ResourceNotFoundException`, the very
+    #     error this resource exists to avoid;
+    #   * removing one left the key in place, and because the delete handler
+    #     reads the CURRENT props it was never unregistered either, so it
+    #     outlived the whole stack as a table nothing could delete;
+    #   * and a REPLACEMENT (a KeySchema change, say) rebuilt the table under a
+    #     new object while the old replica keys still pointed at the orphan, so
+    #     the replicas served stale items and stale schema until the engine's
+    #     cleanup removed the predecessor, after which they served nothing.
+    #
+    # Re-registering the new object against the new region list fixes all three,
+    # and lets the delete handler stay simple.
+    old_regions = _ddb_replica_regions(old_props)
+    new_regions = _ddb_replica_regions(new_props)
+    table = _dynamodb._tables.get(name)
+
+    _ddb_unregister_replicas(name, [r for r in old_regions if r not in new_regions])
+    if table is not None:
+        # Every new region, not just the added ones: on a replacement the object
+        # changed identity, so a region present in both lists still has to be
+        # repointed. `claimed=old_regions` says which keys are ours to repoint.
+        _ddb_register_replicas(name, table, new_regions, claimed=old_regions)
+
+    return name, attrs
 
 
 def _eb_event_bus_update(physical_id, old_props, new_props, stack_name):
