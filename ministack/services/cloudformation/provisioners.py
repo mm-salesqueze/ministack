@@ -8503,11 +8503,19 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
     new_name = new_props.get("Name")
     if project is None or (new_name and new_name != physical_id):
         return _codebuild_project_create(physical_id, new_props, stack_name)
+    # THE SAME TRANSLATION CREATE DOES. Assigning new_props[prop] verbatim wrote
+    # CloudFormation's PascalCase straight back into the project record, so an
+    # update reintroduced exactly the bug create was fixed for: change
+    # Environment.Image, and the record becomes {"Image": ...}, BatchGetProjects
+    # answers environment.image=None, and StartBuild runs a build with no image.
+    # The translation belongs on every path that writes the record, not just the
+    # first one. (The scalars pass through unchanged; the three structured
+    # properties are what need shaping.)
     for prop, key in (("Description", "description"), ("Source", "source"),
                       ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
                       ("Environment", "environment"), ("ServiceRole", "serviceRole")):
         if prop in new_props:
-            project[key] = new_props[prop]
+            project[key] = _cb_api_shape(new_props[prop])
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
     _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,

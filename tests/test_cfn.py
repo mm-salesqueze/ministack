@@ -5729,6 +5729,58 @@ def test_cfn_sns_subscription_raw_message_delivery(cfn, sns, sqs):
 # CodeBuild Project Tests
 # ===========================================================================
 
+@pytest.fixture
+def cb_provisioner_scope():
+    """Ambient account/region for calling the CodeBuild provisioners directly."""
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import codebuild as _cb
+
+    account = "000000000000"
+    set_request_account_id(account)
+    set_request_region("us-east-1")
+    before = set(_cb._projects._data.keys())
+    try:
+        yield account
+    finally:
+        for key in set(_cb._projects._data.keys()) - before:
+            _cb._projects._data.pop(key, None)
+
+
+def _cb_cfn_props(image="aws/codebuild/standard:7.0", compute="BUILD_GENERAL1_SMALL"):
+    return {
+        "Name": "shape-p1",
+        "Source": {"Type": "NO_SOURCE", "BuildSpec": "version: 0.2"},
+        "Artifacts": {"Type": "NO_ARTIFACTS"},
+        "Environment": {"Type": "LINUX_CONTAINER", "Image": image, "ComputeType": compute},
+        "ServiceRole": "arn:aws:iam::000000000000:role/codebuild-role",
+    }
+
+
+def test_codebuild_project_update_keeps_the_api_shape(cb_provisioner_scope):
+    """An update must translate CFN PascalCase like create does.
+
+    Assigning the CFN properties verbatim put PascalCase back into the project
+    record, so changing Environment.Image made the record {"Image": ...},
+    BatchGetProjects answered environment.image=None, and StartBuild ran a build
+    with no image -- the exact defect create was fixed for, reintroduced by an
+    update.
+    """
+    from ministack.services.cloudformation import provisioners as P
+    from ministack.services import codebuild as _cb
+
+    create = _cb_cfn_props()
+    P._codebuild_project_create("P", create, "stk")
+    assert _cb._projects.get("shape-p1")["environment"]["image"] == "aws/codebuild/standard:7.0"
+
+    updated = _cb_cfn_props(image="aws/codebuild/standard:8.0", compute="BUILD_GENERAL1_MEDIUM")
+    P._codebuild_project_update("shape-p1", create, updated, "stk")
+
+    env = _cb._projects.get("shape-p1")["environment"]
+    assert env["image"] == "aws/codebuild/standard:8.0"
+    assert env["computeType"] == "BUILD_GENERAL1_MEDIUM"
+    assert "Image" not in env
+
+
 def test_cfn_codebuild_project_basic(cfn, codebuild):
     """CFN stack with a minimal CodeBuild project deploys successfully."""
     template = {
