@@ -1716,12 +1716,70 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 # ---- Control plane: APIs ----
 
 def find_api_scope(api_id):
-    """Return (account_id, region) owning api_id within the ambient account."""
+    """Return (account_id, region) owning api_id, preferring the ambient account.
+
+    The ambient account comes from the request's SigV4 credentials, and a data
+    plane request does not necessarily have any: an API id is the whole address
+    in every one of the three execute-api forms, and the caller is a browser or
+    an HTTP client, not an SDK. So an API in a non-default account used to be
+    reachable ONLY by signing the request, which is both unlike AWS (where the
+    execute-api hostname identifies the API without credentials) and actively
+    harmful, because the header signing needs is the header applications use:
+    an app doing `Authorization: Bearer <jwt>` cannot also carry SigV4, and its
+    own API answers 404 Not Found.
+
+    Falling back to a global scan removes that. `_api_owner` above already does
+    exactly this for WebSocket dispatch, for the same reason and with the same
+    justification -- an id is unique across the store -- so this is that
+    precedent applied to the path every other protocol takes.
+
+    The ambient-account match is still tried FIRST, so behaviour is unchanged
+    wherever it succeeds; only the case that used to 404 resolves differently.
+    """
     account_id = get_account_id()
+    others = []
     for (stored_account, region, stored_api_id), _api in _apis.all_items():
-        if stored_account == account_id and stored_api_id == api_id:
+        if stored_api_id != api_id:
+            continue
+        if stored_account == account_id:
             return stored_account, region
-    return None
+        if (stored_account, region) not in others:
+            others.append((stored_account, region))
+
+    # ONLY WHEN IT IS UNAMBIGUOUS. The whole justification for looking outside
+    # the ambient account is that an api id names exactly one API -- and that
+    # stopped being guaranteed the moment `ms-custom-id` uniqueness was correctly
+    # scoped per account, because two accounts pinning the same id is then normal
+    # and legal. Returning the first match made the winner dict insertion order:
+    # a request silently served by whichever account deployed first, with no
+    # error and no way to address the other.
+    #
+    # Refusing is the honest answer. The caller turns None into 404, and the log
+    # line names both candidates, which is a diagnosable failure rather than a
+    # wrong success. Signing the request still reaches either one, because the
+    # ambient-account branch above takes precedence.
+    if len(others) > 1:
+        logger.warning(
+            "execute-api id %s exists in more than one account (%s); refusing to "
+            "guess. Sign the request, or give the APIs distinct ms-custom-id tags.",
+            api_id, ", ".join(f"{a}/{r}" for a, r in others))
+        return None
+    return others[0] if others else None
+
+
+def api_id_taken_in_account(api_id):
+    """Is this api id already used IN THE AMBIENT ACCOUNT?
+
+    Deliberately not `find_api_scope`, which resolves across every account so a
+    credential-less data-plane request can reach its API. Uniqueness is a
+    different question: AWS assigns api ids per account, and two accounts holding
+    the same id is normal. Using the cross-account lookup for the conflict check
+    made a pinned `ms-custom-id` a globally exclusive claim, so the same stable
+    id in a second account answered 409 where it used to deploy.
+    """
+    account_id = get_account_id()
+    return any(stored_api_id == api_id and stored_account == account_id
+               for (stored_account, _region, stored_api_id), _api in _apis.all_items())
 
 
 def stages_for_api(api_id):
@@ -1753,7 +1811,7 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> s
     custom = tags.get("ms-custom-id")
     if not custom:
         return None
-    if existing is _apis and find_api_scope(str(custom)) is not None:
+    if existing is _apis and api_id_taken_in_account(str(custom)):
         raise ValueError(
             f"API id '{custom}' (from ms-custom-id tag) is already in use"
         )
@@ -2442,17 +2500,40 @@ def _api_protocol(api_id: str) -> str | None:
 
 
 def _api_owner(api_id: str):
-    """Return (protocolType, owner_account_id, owner_region) for an API or None."""
-    # WebSocket dispatch arrives before we know the owning account or region, so
-    # scan every account+region slot directly.
+    """Return (protocolType, owner_account_id, owner_region) for an API or None.
+
+    WebSocket dispatch arrives before we know the owning account or region, so
+    this scans every account+region slot -- but with the SAME two rules
+    `find_api_scope` uses, because this is the resolver for the whole WebSocket
+    surface and it was answering differently from the HTTP one.
+
+    THE AMBIENT ACCOUNT WINS. A signed connect to your own API was served by
+    another account's API of the same id, and `handle_websocket` then scopes the
+    entire session to the owner it returns -- so $connect, $disconnect and every
+    route Lambda ran in the wrong account.
+
+    AND AMBIGUITY IS REFUSED rather than guessed. Two accounts holding one id is
+    legal now that `ms-custom-id` uniqueness is per account, so returning the
+    first match made the winner dict insertion order.
+    """
+    account_id = get_account_id()
+    others = []
     for (acct, region, key), api in _apis.all_items():
-        if key == api_id:
-            return (
-                api.get("protocolType", "HTTP"),
-                acct,
-                region,
-            )
-    return None
+        if key != api_id:
+            continue
+        entry = (api.get("protocolType", "HTTP"), acct, region)
+        if acct == account_id:
+            return entry
+        if entry not in others:
+            others.append(entry)
+
+    if len(others) > 1:
+        logger.warning(
+            "WebSocket api id %s exists in more than one account (%s); refusing to "
+            "guess. Sign the request, or give the APIs distinct ms-custom-id tags.",
+            api_id, ", ".join(f"{a}/{r}" for _p, a, r in others))
+        return None
+    return others[0] if others else None
 
 
 def _match_ws_route(api_id: str, route_key: str):

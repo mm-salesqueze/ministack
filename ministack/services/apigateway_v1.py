@@ -871,12 +871,74 @@ def _restore_child_store(store, restored, parent_regions, parent_name_from_key=l
 
 
 def find_api_scope(api_id):
-    """Return (account_id, region) owning api_id within the ambient account."""
+    """Return (account_id, region) owning api_id, preferring the ambient account.
+
+    The v1 half of the same fix as `apigateway.find_api_scope`, and the half
+    that matters most in practice, because REST is what a CDK app deploys.
+
+    The ambient account comes from the request's SigV4 credentials, and a data
+    plane request does not necessarily have any: the api id is the whole address
+    in every one of the three execute-api forms, and the caller is a browser or
+    an application HTTP client, not an SDK. So a REST API in a non-default
+    account used to be reachable ONLY by signing the request, which is both
+    unlike AWS -- where the execute-api hostname identifies the API without any
+    credentials -- and actively harmful, because the header that signing needs
+    is the header applications use. An app authenticating with
+    `Authorization: Bearer <jwt>` cannot also carry SigV4, so its own API
+    answers 404 Not Found and nothing says why.
+
+    `apigateway._api_owner` already scans every account for WebSocket dispatch,
+    for the same reason and with the same justification: an api id is unique
+    across the store. This is that precedent applied to REST.
+
+    The ambient-account match is still tried FIRST, so behaviour is unchanged
+    wherever it already succeeded; only the case that used to 404 resolves.
+    """
     account_id = get_account_id()
+    others = []
     for (stored_account, region, stored_api_id), _api in _rest_apis.all_items():
-        if stored_account == account_id and stored_api_id == api_id:
+        if stored_api_id != api_id:
+            continue
+        if stored_account == account_id:
             return stored_account, region
-    return None
+        if (stored_account, region) not in others:
+            others.append((stored_account, region))
+
+    # ONLY WHEN IT IS UNAMBIGUOUS. The whole justification for looking outside
+    # the ambient account is that an api id names exactly one API -- and that
+    # stopped being guaranteed the moment `ms-custom-id` uniqueness was correctly
+    # scoped per account, because two accounts pinning the same id is then normal
+    # and legal. Returning the first match made the winner dict insertion order:
+    # a request silently served by whichever account deployed first, with no
+    # error and no way to address the other.
+    #
+    # Refusing is the honest answer. The caller turns None into 404, and the log
+    # line names both candidates, which is a diagnosable failure rather than a
+    # wrong success. Signing the request still reaches either one, because the
+    # ambient-account branch above takes precedence.
+    if len(others) > 1:
+        logger.warning(
+            "execute-api id %s exists in more than one account (%s); refusing to "
+            "guess. Sign the request, or give the APIs distinct ms-custom-id tags.",
+            api_id, ", ".join(f"{a}/{r}" for a, r in others))
+        return None
+    return others[0] if others else None
+
+
+def api_id_taken_in_account(api_id):
+    """Is this api id already used IN THE AMBIENT ACCOUNT?
+
+    Deliberately not `find_api_scope`, which resolves across every account so a
+    credential-less data-plane request can reach its API. Uniqueness is a
+    different question: AWS assigns api ids per account, and two accounts holding
+    the same id is normal. Using the cross-account lookup for the conflict check
+    turned a pinned `ms-custom-id` into a globally exclusive claim, so the same
+    stable id in a second account started answering 409 ConflictException where
+    it used to deploy.
+    """
+    account_id = get_account_id()
+    return any(stored_api_id == api_id and stored_account == account_id
+               for (stored_account, _region, stored_api_id), _api in _rest_apis.all_items())
 
 
 def find_domain_scope(domain_name):
@@ -885,11 +947,16 @@ def find_domain_scope(domain_name):
 
     Host headers are case-insensitive, so the comparison lowercases both
     sides; ``stored_name`` is the exact key the control plane stored, which
-    the child-store lookup needs. A data-plane request addressed by a custom
-    domain carries no signed scope, so like ``find_api_scope`` this resolves
-    within the ambient account. EDGE global name uniqueness across accounts
-    stays unenforced (see the module docstring) — the ambient default covers
-    the single-account case a local stack actually runs."""
+    the child-store lookup needs.
+
+    UNLIKE ``find_api_scope``, this stays inside the ambient account. The
+    argument for scanning every account applies here just as well — a request
+    addressed by a custom domain carries no signed scope either — so a custom
+    domain in a non-default account still 404s, and that is a known gap rather
+    than a considered difference. It is left as it is because a domain name,
+    unlike an api id, is not something this store keeps unique across accounts,
+    so a global scan would have to invent a tie-break. EDGE global name
+    uniqueness stays unenforced (see the module docstring)."""
     account_id = get_account_id()
     wanted = domain_name.lower()
     for (stored_account, region, stored_domain), _rec in _domain_names.all_items():
@@ -2213,8 +2280,10 @@ def _resolve_custom_rest_api_id(tags: dict) -> tuple[str | None, tuple | None]:
     if not custom:
         return None, None
     # Execute-api hosts identify REST APIs by id without a region segment, so
-    # caller-pinned ids must stay unique across every region in this account.
-    if find_api_scope(custom) is not None:
+    # caller-pinned ids must stay unique across every region in this account --
+    # IN THIS ACCOUNT, which is why this is not `find_api_scope`. See
+    # `api_id_taken_in_account`.
+    if api_id_taken_in_account(custom):
         return None, _v1_error(
             "ConflictException",
             f"REST API id '{custom}' (from ms-custom-id tag) is already in use",

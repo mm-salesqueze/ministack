@@ -19,6 +19,68 @@ _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566
 
+def test_cross_account_resolution_refuses_an_ambiguous_id():
+    """The scan may only answer when the id names exactly one API.
+
+    Looking outside the ambient account is justified by an api id naming one
+    thing -- which stopped being guaranteed the moment ms-custom-id uniqueness
+    was correctly scoped per account, because two accounts pinning the same id is
+    then legal. Returning the first match made the winner dict insertion order: a
+    request silently served by whichever account deployed first.
+    """
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import apigateway_v1 as v1
+
+    set_request_region("us-east-1")
+    for account in ("111111111111", "222222222222"):
+        v1._rest_apis.set_scoped(account, "us-east-1", "dupid", {"id": "dupid"})
+    v1._rest_apis.set_scoped("111111111111", "us-east-1", "soloid", {"id": "soloid"})
+    try:
+        # No ambient match: unique resolves, ambiguous refuses rather than guesses.
+        set_request_account_id("000000000000")
+        assert v1.find_api_scope("soloid") == ("111111111111", "us-east-1")
+        assert v1.find_api_scope("dupid") is None
+
+        # Signing still reaches either one -- the ambient branch takes precedence.
+        set_request_account_id("222222222222")
+        assert v1.find_api_scope("dupid") == ("222222222222", "us-east-1")
+        set_request_account_id("111111111111")
+        assert v1.find_api_scope("dupid") == ("111111111111", "us-east-1")
+    finally:
+        for account in ("111111111111", "222222222222"):
+            v1._rest_apis._data.pop((account, "us-east-1", "dupid"), None)
+        v1._rest_apis._data.pop(("111111111111", "us-east-1", "soloid"), None)
+        set_request_account_id("000000000000")
+
+
+def test_custom_api_id_uniqueness_is_per_account():
+    """A pinned ms-custom-id must be claimable in more than one account.
+
+    The conflict check called find_api_scope, which resolves across EVERY
+    account so a credential-less data-plane request can reach its API. That is a
+    different question from uniqueness -- AWS assigns api ids per account -- so
+    the same stable id in a second account started answering 409 where it used
+    to deploy.
+    """
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import apigateway_v1 as v1
+
+    set_request_region("us-east-1")
+    set_request_account_id("111111111111")
+    v1._rest_apis.set_scoped("111111111111", "us-east-1", "dupid001", {"id": "dupid001"})
+    try:
+        assert v1.api_id_taken_in_account("dupid001") is True
+
+        set_request_account_id("222222222222")
+        assert v1.api_id_taken_in_account("dupid001") is False
+        # ...while the data plane still resolves it, which is the whole point
+        # of the cross-account scan.
+        assert v1.find_api_scope("dupid001") == ("111111111111", "us-east-1")
+    finally:
+        v1._rest_apis._data.pop(("111111111111", "us-east-1", "dupid001"), None)
+        set_request_account_id("000000000000")
+
+
 def test_apigwv1_create_rest_api(apigw_v1):
     """CreateRestApi returns id, name, and createdDate as datetime."""
     import datetime
