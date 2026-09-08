@@ -5424,6 +5424,35 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
+# CloudFormation spells these PascalCase and the CodeBuild API camelCase, and
+# both are generated from the same model — so lowering the first letter is the
+# whole mapping, with exactly one exception. Verified against botocore's
+# codebuild-2016-10-06 model rather than derived by hand.
+_CB_NAME_EXCEPTIONS = {"BuildSpec": "buildspec"}
+
+
+def _cb_api_shape(value):
+    """Reshape a CloudFormation property tree into the CodeBuild API's own shape.
+
+    Storing the CloudFormation shape verbatim left every field invisible: the
+    API serialises camelCase, so `BatchGetProjects` answered `source={}` and
+    `environment.image=None` for a project CloudFormation had just created, and
+    starting a build on it failed having run nothing — SUBMITTED, QUEUED,
+    COMPLETED, no DOWNLOAD_SOURCE, no BUILD. The same project created over the
+    API builds normally, which is what makes this a translation bug rather than
+    a missing feature.
+    """
+    if isinstance(value, list):
+        return [_cb_api_shape(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, item in value.items():
+        name = _CB_NAME_EXCEPTIONS.get(key) or (key[:1].lower() + key[1:] if key else key)
+        out[name] = _cb_api_shape(item)
+    return out
+
+
 def _codebuild_project_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
     
@@ -5434,14 +5463,14 @@ def _codebuild_project_create(logical_id, props, stack_name):
     data = {
         "name": name,
         "description": props.get("Description", ""),
-        "source": props.get("Source", {"type": "NO_SOURCE"}),
+        "source": _cb_api_shape(props.get("Source")) or {"type": "NO_SOURCE"},
         "sourceVersion": props.get("SourceVersion", ""),
-        "artifacts": props.get("Artifacts", {"type": "NO_ARTIFACTS"}),
-        "environment": props.get("Environment", {
+        "artifacts": _cb_api_shape(props.get("Artifacts")) or {"type": "NO_ARTIFACTS"},
+        "environment": _cb_api_shape(props.get("Environment")) or {
             "type": "LINUX_CONTAINER",
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
-        }),
+        },
         "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
@@ -8837,11 +8866,19 @@ def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
     new_name = new_props.get("Name")
     if project is None or (new_name and new_name != physical_id):
         return _codebuild_project_create(physical_id, new_props, stack_name)
+    # THE SAME TRANSLATION CREATE DOES. Assigning new_props[prop] verbatim wrote
+    # CloudFormation's PascalCase straight back into the project record, so an
+    # update reintroduced exactly the bug create was fixed for: change
+    # Environment.Image, and the record becomes {"Image": ...}, BatchGetProjects
+    # answers environment.image=None, and StartBuild runs a build with no image.
+    # The translation belongs on every path that writes the record, not just the
+    # first one. (The scalars pass through unchanged; the three structured
+    # properties are what need shaping.)
     for prop, key in (("Description", "description"), ("Source", "source"),
                       ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
                       ("Environment", "environment"), ("ServiceRole", "serviceRole")):
         if prop in new_props:
-            project[key] = new_props[prop]
+            project[key] = _cb_api_shape(new_props[prop])
     if "TimeoutInMinutes" in new_props:
         project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
     _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
