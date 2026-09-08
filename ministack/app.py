@@ -2167,12 +2167,22 @@ async def _dispatch_service_request(
                 service, method, path, headers, body, routing_params, region, get_account_id()
             )
             denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
-            # A copy also reads its source, a batch delete is one check per
-            # key, an attributes call is a pair, a governance bypass its own action.
-            if service == "s3" and not denied:
-                from ministack.core.iam_actions import s3_additional_checks
+            # Some requests name MORE THAN ONE resource and AWS authorises every
+            # one: a copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own
+            # action -- and ECR's DescribeRepositories takes a list of names.
+            # `extract_resource_arn` can only answer with a single ARN, so the
+            # remainder are enforced here.
+            if not denied:
+                extra_checks: list = []
+                if service == "s3":
+                    from ministack.core.iam_actions import s3_additional_checks
+                    extra_checks = s3_additional_checks(method, path, headers, body, routing_params)
+                elif service == "ecr":
+                    from ministack.core.iam_actions import ecr_additional_checks
+                    extra_checks = ecr_additional_checks(method, path, headers, body, routing_params)
 
-                for extra_action, extra_arn in s3_additional_checks(method, path, headers, body, routing_params):
+                for extra_action, extra_arn in extra_checks:
                     denied = enforce(access_key, extra_action, service, region, resource_arn=extra_arn)
                     if denied:
                         iam_action = extra_action
