@@ -8121,6 +8121,95 @@ Outputs:
 """
 
 
+def _parse_distribution_config(props):
+    """Render CFN DistributionConfig props and parse them back with botocore.
+
+    The point is the ROUND TRIP: these bugs never produced malformed XML, they
+    produced XML an SDK quietly drops members from, so only a real parser shows
+    them.
+    """
+    import gzip
+    import json as _json
+    import os as _os
+    from xml.etree.ElementTree import tostring
+
+    import botocore
+    from botocore.model import ServiceModel
+    from botocore.parsers import RestXMLParser
+
+    from ministack.services.cloudformation.provisioners import (
+        _cf_normalise_distribution_props,
+        _cf_props_to_element,
+    )
+
+    root = _os.path.join(_os.path.dirname(botocore.__file__), "data", "cloudfront")
+    version = sorted(_os.listdir(root))[-1]
+    path = _os.path.join(root, version, "service-2.json")
+    raw = gzip.open(path + ".gz").read() if _os.path.exists(path + ".gz") else open(path, "rb").read()
+    shape = ServiceModel(_json.loads(raw)).shape_for("DistributionConfig")
+
+    element = _cf_props_to_element("DistributionConfig",
+                                   _cf_normalise_distribution_props(props))
+    xml = tostring(element, encoding="unicode").encode()
+    return RestXMLParser().parse(
+        {"body": xml, "headers": {}, "status_code": 200}, shape)
+
+
+def test_distribution_geo_restriction_survives_the_round_trip():
+    """CFN nests the countries under Locations; the XML makes GeoRestriction the
+    counted block. Unfolded, botocore parsed the block back as just
+    {"RestrictionType": ...} -- a geo-restricted distribution serving the world."""
+    parsed = _parse_distribution_config({
+        "Enabled": True,
+        "Restrictions": {"GeoRestriction": {"RestrictionType": "whitelist",
+                                            "Locations": ["US", "CA"]}},
+    })
+    geo = parsed["Restrictions"]["GeoRestriction"]
+    assert geo["RestrictionType"] == "whitelist"
+    assert geo["Quantity"] == 2
+    assert geo["Items"] == ["US", "CA"]
+
+
+def test_distribution_viewer_certificate_acronyms_survive_the_round_trip():
+    """CFN lower-cases these acronyms and the XML does not, so an unrenamed
+    element is simply not recognised: a distribution with a custom domain read
+    back as though it had no certificate."""
+    parsed = _parse_distribution_config({
+        "Enabled": True,
+        "ViewerCertificate": {
+            "AcmCertificateArn": "arn:aws:acm:us-east-1:1:certificate/x",
+            "SslSupportMethod": "sni-only",
+            "MinimumProtocolVersion": "TLSv1.2_2021",
+        },
+    })
+    cert = parsed["ViewerCertificate"]
+    assert cert["ACMCertificateArn"] == "arn:aws:acm:us-east-1:1:certificate/x"
+    assert cert["SSLSupportMethod"] == "sni-only"
+
+
+def test_distribution_ipv6_flag_survives_the_round_trip():
+    """CFN calls it IPV6Enabled, the XML IsIPV6Enabled; unrenamed, ministack's
+    own ListDistributions then defaulted it back to true."""
+    parsed = _parse_distribution_config({"Enabled": True, "IPV6Enabled": False})
+    assert parsed["IsIPV6Enabled"] is False
+
+
+def test_distribution_origin_group_members_survive_the_round_trip():
+    """Members' entries are dicts, so the default <Name> item tag produced
+    <Name><OriginId>..</OriginId></Name> and the members were dropped."""
+    parsed = _parse_distribution_config({
+        "Enabled": True,
+        "OriginGroups": {"Quantity": 1, "Items": [{
+            "Id": "og1",
+            "FailoverCriteria": {"StatusCodes": {"Quantity": 1, "Items": [500]}},
+            "Members": {"Quantity": 2, "Items": [{"OriginId": "o1"}, {"OriginId": "o2"}]},
+        }]},
+    })
+    members = parsed["OriginGroups"]["Items"][0]["Members"]
+    assert members["Quantity"] == 2
+    assert members["Items"] == [{"OriginId": "o1"}, {"OriginId": "o2"}]
+
+
 def test_cfn_cloudfront_keyvaluestore_create_update_delete(cfn, cloudfront):
     """AWS::CloudFront::KeyValueStore: create via CFN, update Comment via
     UpdateStack (in-place; AWS spec only allows Comment to change), describe

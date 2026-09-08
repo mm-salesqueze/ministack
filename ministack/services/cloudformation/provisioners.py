@@ -156,9 +156,10 @@ _CF_LIST_ITEM_TAGS = {
     "CacheBehaviors": "CacheBehavior",
     "CustomErrorResponses": "CustomErrorResponse",
     # Keyed on the XML name, not the CloudFormation one: OriginCustomHeaders is renamed to
-    # CustomHeaders before the tag is looked up, and missing this entry emits <Name> children that
-    # a REST-XML SDK parses as Quantity 2 with an EMPTY Items list — the header silently absent
-    # rather than malformed.
+    # CustomHeaders before the tag is looked up. Miss the entry and the children are emitted as
+    # <Name>, which a NAME-MATCHING REST-XML SDK (Go v2, Java v2) reads as Quantity 2 with an
+    # empty Items list -- the header silently absent rather than malformed. botocore is more
+    # forgiving and parses them back, so a Python-only test will not show this.
     "CustomHeaders": "OriginCustomHeader",
     "AllowedMethods": "Method",
     "CachedMethods": "Method",
@@ -168,6 +169,16 @@ _CF_LIST_ITEM_TAGS = {
     "StatusCodes": "StatusCode",
     "TrustedKeyGroups": "KeyGroup",
     "TrustedSigners": "AwsAccountNumber",
+    # GeoRestriction is the counted block itself in the XML (CFN nests the
+    # countries under `Locations`, which _cf_normalise_distribution_props folds
+    # in), and its items are <Location>. Without this the countries went out as
+    # <Name> and botocore dropped the lot.
+    "GeoRestriction": "Location",
+    # The one remaining DistributionConfig list whose items are not <Name>:
+    # OriginGroup.Members. Its entries are dicts, so the wrong tag produced
+    # <Name><OriginId>…</OriginId></Name> -- exactly the shape this table exists
+    # to prevent.
+    "Members": "OriginGroupMember",
 }
 
 
@@ -7429,19 +7440,40 @@ def _cf_oai_delete(physical_id, props):
 _CF_DIST_RENAMES = {
     "OriginCustomHeaders": "CustomHeaders",
     "OriginSSLProtocols": "OriginSslProtocols",
+    # CloudFormation lower-cases these acronyms and the XML does not. Checked
+    # against botocore's cloudfront model rather than guessed: ViewerCertificate's
+    # members really are ACMCertificateArn / IAMCertificateId / SSLSupportMethod,
+    # and DistributionConfig's flag really is IsIPV6Enabled.
+    #
+    # Omitting them did not produce a malformed document, which is why it went
+    # unnoticed: the SDK simply does not recognise the element and drops it, so a
+    # distribution with a custom domain read back as though it had no
+    # certificate at all, and Terraform saw permanent drift.
+    "AcmCertificateArn": "ACMCertificateArn",
+    "IamCertificateId": "IAMCertificateId",
+    "SslSupportMethod": "SSLSupportMethod",
+    "IPV6Enabled": "IsIPV6Enabled",
 }
 
 
 def _cf_normalise_distribution_props(value):
     """Reshape a DistributionConfig property tree into the XML's own shape.
 
-    Only where the two genuinely differ, which is in three places:
+    The two schemas diverge in more places than is obvious; these are the ones
+    reachable from a DistributionConfig:
 
     - ``CachedMethods`` is a sibling of ``AllowedMethods`` in CloudFormation and
-      a child of it in the XML. This is the only structural difference; the rest
-      of the tree maps one to one.
-    - ``OriginCustomHeaders`` is ``CustomHeaders`` in the XML.
-    - ``OriginSSLProtocols`` differs only in case, which XML does not forgive.
+      a child of it in the XML.
+    - ``GeoRestriction`` wraps its countries in a ``Locations`` property in
+      CloudFormation, while in the XML ``GeoRestriction`` *is* the counted block
+      and the countries are its ``Items``.
+    - six members differ only in spelling -- ``OriginCustomHeaders``,
+      ``OriginSSLProtocols``, and the four acronym cases in ``_CF_DIST_RENAMES``
+      -- which XML does not forgive.
+
+    Everything else maps one to one. The legacy top-level properties (``CNAMEs``,
+    ``CustomOrigin``, ``S3Origin``) have no XML equivalent at all and are left
+    alone rather than half-translated.
     """
     if isinstance(value, list):
         return [_cf_normalise_distribution_props(item) for item in value]
@@ -7450,6 +7482,16 @@ def _cf_normalise_distribution_props(value):
 
     out = {_CF_DIST_RENAMES.get(key, key): _cf_normalise_distribution_props(item)
            for key, item in value.items()}
+
+    # GeoRestriction: CFN nests the countries under `Locations`, the XML makes
+    # GeoRestriction itself the counted block. Left as-is, the whole restriction
+    # vanished -- botocore parsed the emitted block back as just
+    # {"RestrictionType": ...}, with the required Quantity absent and every
+    # country gone, which is a geo-restricted distribution quietly serving the
+    # world.
+    locations = out.pop("Locations", None)
+    if locations is not None and "RestrictionType" in out:
+        out["Items"] = locations.get("Items", locations) if isinstance(locations, dict) else locations
 
     cached = out.pop("CachedMethods", None)
     if cached is None:
