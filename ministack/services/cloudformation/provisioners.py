@@ -5364,12 +5364,29 @@ def _cognito_user_pool_identity_provider_create(logical_id, props, stack_name):
     if provider_type not in _cognito.VALID_PROVIDER_TYPES:
         raise ValueError(f"Invalid ProviderType: {provider_type}")
 
+    # ProviderDetails is REQUIRED by the CloudFormation schema, and an IdP
+    # without it can never complete a login -- no client id, no secret, no
+    # issuer. Defaulting it to {} let such a template deploy green and fail at
+    # the first sign-in instead.
+    details = props.get("ProviderDetails")
+    if not details:
+        raise ValueError(
+            "AWS::Cognito::UserPoolIdentityProvider requires ProviderDetails")
+
+    # The API returns DuplicateProviderException here; silently overwriting meant
+    # two resources declaring the same ProviderName in one pool both "succeeded"
+    # and the second quietly won, where AWS fails the stack.
+    existing = pool.setdefault("_identity_providers", {})
+    if provider_name in existing:
+        raise ValueError(
+            f"Identity provider {provider_name} already exists in user pool {pid}")
+
     now = _cognito._now_epoch()
-    pool.setdefault("_identity_providers", {})[provider_name] = {
+    existing[provider_name] = {
         "UserPoolId": pid,
         "ProviderName": provider_name,
         "ProviderType": provider_type,
-        "ProviderDetails": props.get("ProviderDetails", {}) or {},
+        "ProviderDetails": details,
         "AttributeMapping": props.get("AttributeMapping", {}) or {},
         "IdpIdentifiers": props.get("IdpIdentifiers", []) or [],
         "CreationDate": now,
@@ -5378,6 +5395,41 @@ def _cognito_user_pool_identity_provider_create(logical_id, props, stack_name):
     # Ref on this resource type returns the ProviderName (matches real AWS —
     # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolidentityprovider.html#aws-resource-cognito-userpoolidentityprovider-return-values).
     return provider_name, {}
+
+
+def _cognito_user_pool_identity_provider_update(physical_id, old_props, new_props, stack_name):
+    """Update in place, or MOVE the provider when its pool changes.
+
+    AWS marks `UserPoolId` "Update requires: Replacement", but the physical id of
+    this resource is the ProviderName (that is what Ref returns), and the
+    provider name does not change when the pool does. So the engine saw an
+    unchanged physical id, decided nothing was replaced, and never deleted the
+    predecessor -- the provider stayed registered on the OLD pool, whose hosted
+    UI went on offering a login the template no longer described.
+
+    Handling the move here keeps Ref correct while still removing the old one.
+    """
+    old_pool_id = old_props.get("UserPoolId", "")
+    new_pool_id = new_props.get("UserPoolId", "")
+    if old_pool_id and new_pool_id and old_pool_id != new_pool_id:
+        old_pool = _cognito._user_pools.get(old_pool_id)
+        if old_pool:
+            old_pool.get("_identity_providers", {}).pop(physical_id, None)
+        return _cognito_user_pool_identity_provider_create(
+            physical_id, new_props, stack_name)
+
+    # Same pool: the mutable properties change in place, which is what AWS's
+    # "No interruption" means for them.
+    pool = _cognito._user_pools.get(new_pool_id)
+    record = (pool or {}).get("_identity_providers", {}).get(physical_id)
+    if record is None:
+        return _cognito_user_pool_identity_provider_create(
+            physical_id, new_props, stack_name)
+    for prop in ("ProviderDetails", "AttributeMapping", "IdpIdentifiers"):
+        if prop in new_props:
+            record[prop] = new_props[prop]
+    record["LastModifiedDate"] = _cognito._now_epoch()
+    return physical_id, {}
 
 
 def _cognito_user_pool_identity_provider_delete(physical_id, props):
@@ -8844,7 +8896,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_delete,
     },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
-    "AWS::Cognito::UserPoolIdentityProvider": {"create": _cognito_user_pool_identity_provider_create, "delete": _cognito_user_pool_identity_provider_delete},
+    "AWS::Cognito::UserPoolIdentityProvider": {"create": _cognito_user_pool_identity_provider_create, "update": _cognito_user_pool_identity_provider_update, "delete": _cognito_user_pool_identity_provider_delete},
     "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
     "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
