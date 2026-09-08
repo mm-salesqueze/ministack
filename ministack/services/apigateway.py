@@ -1748,6 +1748,21 @@ def find_api_scope(api_id):
     return fallback
 
 
+def api_id_taken_in_account(api_id):
+    """Is this api id already used IN THE AMBIENT ACCOUNT?
+
+    Deliberately not `find_api_scope`, which resolves across every account so a
+    credential-less data-plane request can reach its API. Uniqueness is a
+    different question: AWS assigns api ids per account, and two accounts holding
+    the same id is normal. Using the cross-account lookup for the conflict check
+    made a pinned `ms-custom-id` a globally exclusive claim, so the same stable
+    id in a second account answered 409 where it used to deploy.
+    """
+    account_id = get_account_id()
+    return any(stored_api_id == api_id and stored_account == account_id
+               for (stored_account, _region, stored_api_id), _api in _apis.all_items())
+
+
 def stages_for_api(api_id):
     """Return stages for api_id after resolving the v2 data-plane owner scope."""
     scope = find_api_scope(api_id)
@@ -1777,7 +1792,7 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> s
     custom = tags.get("ms-custom-id")
     if not custom:
         return None
-    if existing is _apis and find_api_scope(str(custom)) is not None:
+    if existing is _apis and api_id_taken_in_account(str(custom)):
         raise ValueError(
             f"API id '{custom}' (from ms-custom-id tag) is already in use"
         )

@@ -1495,6 +1495,28 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _execute_api_module(api_id: str):
+    """Which of the two API Gateway modules owns this api id, or None.
+
+    THE AMBIENT ACCOUNT WINS, whichever protocol it is. Asking v1 first and
+    falling straight through to its cross-account scan meant a REST API in
+    ANOTHER account outranked an HTTP API with the same pinned id in the caller's
+    own account, and the request was silently served by the wrong one. Only once
+    neither module has it locally does the cross-account resolution -- which
+    exists so a credential-less data-plane request can still reach its API --
+    come into play, v1 first as before.
+    """
+    apigw_v1 = _get_module("apigateway_v1")
+    apigw_v2 = _get_module("apigateway")
+    for mod in (apigw_v1, apigw_v2):
+        if mod.api_id_taken_in_account(api_id):
+            return mod
+    for mod in (apigw_v1, apigw_v2):
+        if mod.find_api_scope(api_id) is not None:
+            return mod
+    return None
+
+
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
     """Pick (stage, execute_path) based on the API's configured stages.
 
@@ -1510,11 +1532,8 @@ def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str
         whole original path (including ``tentative_stage``) as ``execute_path``.
       - Else fall through (``handle_execute`` will return "Stage not found").
     """
-    apigw_v1 = _get_module("apigateway_v1")
-    if apigw_v1.find_api_scope(api_id) is not None:
-        stages_map = apigw_v1.stages_for_api(api_id)
-    else:
-        stages_map = _get_module("apigateway").stages_for_api(api_id)
+    owner = _execute_api_module(api_id)
+    stages_map = owner.stages_for_api(api_id) if owner is not None else {}
 
     if tentative_stage in stages_map:
         return tentative_stage, execute_path
@@ -1586,13 +1605,12 @@ async def _handle_execute_api_request(
             stage = tentative_stage
         else:
             stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
-        apigw_v1 = _get_module("apigateway_v1")
-        if apigw_v1.find_api_scope(api_id) is not None:
-            return await apigw_v1.handle_execute(api_id, stage, method, execute_path, headers, body, query_params)
-        apigw_v2 = _get_module("apigateway")
-        if apigw_v2.find_api_scope(api_id) is None:
+        owner = _execute_api_module(api_id)
+        if owner is None:
             return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
-        return await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        if owner is _get_module("apigateway_v1"):
+            return await owner.handle_execute(api_id, stage, method, execute_path, headers, body, query_params)
+        return await owner.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()

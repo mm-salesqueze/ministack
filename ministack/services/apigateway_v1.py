@@ -906,17 +906,38 @@ def find_api_scope(api_id):
     return fallback
 
 
+def api_id_taken_in_account(api_id):
+    """Is this api id already used IN THE AMBIENT ACCOUNT?
+
+    Deliberately not `find_api_scope`, which resolves across every account so a
+    credential-less data-plane request can reach its API. Uniqueness is a
+    different question: AWS assigns api ids per account, and two accounts holding
+    the same id is normal. Using the cross-account lookup for the conflict check
+    turned a pinned `ms-custom-id` into a globally exclusive claim, so the same
+    stable id in a second account started answering 409 ConflictException where
+    it used to deploy.
+    """
+    account_id = get_account_id()
+    return any(stored_api_id == api_id and stored_account == account_id
+               for (stored_account, _region, stored_api_id), _api in _rest_apis.all_items())
+
+
 def find_domain_scope(domain_name):
     """Return (account_id, region, stored_name) owning a custom domain within
     the ambient account.
 
     Host headers are case-insensitive, so the comparison lowercases both
     sides; ``stored_name`` is the exact key the control plane stored, which
-    the child-store lookup needs. A data-plane request addressed by a custom
-    domain carries no signed scope, so like ``find_api_scope`` this resolves
-    within the ambient account. EDGE global name uniqueness across accounts
-    stays unenforced (see the module docstring) — the ambient default covers
-    the single-account case a local stack actually runs."""
+    the child-store lookup needs.
+
+    UNLIKE ``find_api_scope``, this stays inside the ambient account. The
+    argument for scanning every account applies here just as well — a request
+    addressed by a custom domain carries no signed scope either — so a custom
+    domain in a non-default account still 404s, and that is a known gap rather
+    than a considered difference. It is left as it is because a domain name,
+    unlike an api id, is not something this store keeps unique across accounts,
+    so a global scan would have to invent a tie-break. EDGE global name
+    uniqueness stays unenforced (see the module docstring)."""
     account_id = get_account_id()
     wanted = domain_name.lower()
     for (stored_account, region, stored_domain), _rec in _domain_names.all_items():
@@ -2240,8 +2261,10 @@ def _resolve_custom_rest_api_id(tags: dict) -> tuple[str | None, tuple | None]:
     if not custom:
         return None, None
     # Execute-api hosts identify REST APIs by id without a region segment, so
-    # caller-pinned ids must stay unique across every region in this account.
-    if find_api_scope(custom) is not None:
+    # caller-pinned ids must stay unique across every region in this account --
+    # IN THIS ACCOUNT, which is why this is not `find_api_scope`. See
+    # `api_id_taken_in_account`.
+    if api_id_taken_in_account(custom):
         return None, _v1_error(
             "ConflictException",
             f"REST API id '{custom}' (from ms-custom-id tag) is already in use",
