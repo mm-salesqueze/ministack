@@ -382,11 +382,11 @@ def test_execute_build_removes_its_workspace(monkeypatch, tmp_path):
     _seed_execution_build(project)
     codebuild._execute_build("demo:0001", project)
 
-    # src/ and env/ go; artifacts/ stays, because nothing here uploads it and
-    # the workspace is therefore the only copy of the build output.
-    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001", "src"))
-    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001", "env"))
-    assert os.path.isdir(os.path.join(str(tmp_path), "demo_0001", "artifacts"))
+    # The execution project declares NO_ARTIFACTS, so there is no output to
+    # preserve and the whole build directory goes -- keeping an always-empty
+    # artifacts/ was what made os.rmdir unreachable and leaked a directory per
+    # build.
+    assert not os.path.exists(os.path.join(str(tmp_path), "demo_0001"))
 
 
 def test_reap_workspace_refuses_a_target_outside_the_root(monkeypatch, tmp_path):
@@ -399,14 +399,18 @@ def test_reap_workspace_refuses_a_target_outside_the_root(monkeypatch, tmp_path)
     root = tmp_path / "ws"
     (root / "demo").mkdir(parents=True)
     outside = tmp_path / "outside"
-    outside.mkdir()
-    (outside / "keep.txt").write_text("x")
+    # src/ and env/ specifically: without them the reaper has nothing to delete
+    # and the test passes whether or not the containment check exists. It did.
+    (outside / "src").mkdir(parents=True)
+    (outside / "src" / "keep.txt").write_text("x")
+    (outside / "env").mkdir()
     monkeypatch.setattr(codebuild, "WORKSPACE", str(root))
     monkeypatch.delenv("CODEBUILD_KEEP_WORKSPACE", raising=False)
 
     codebuild._reap_workspace(str(root / ".." / "outside"), "demo:0001")
 
-    assert (outside / "keep.txt").exists()
+    assert (outside / "src" / "keep.txt").exists()
+    assert (outside / "env").is_dir()
 
 
 def test_reap_workspace_refuses_the_root_itself(monkeypatch, tmp_path):
@@ -418,6 +422,37 @@ def test_reap_workspace_refuses_the_root_itself(monkeypatch, tmp_path):
     codebuild._reap_workspace(str(root), "demo:0001")
 
     assert (root / "src").is_dir()
+
+
+def test_workspace_dirname_is_always_one_safe_segment():
+    """The build id carries a project name, and the name is attacker-controlled.
+
+    CreateProject only checks non-empty where AWS enforces
+    [A-Za-z0-9][A-Za-z0-9-_]{1,254}, so `../../etc` was accepted and EVERY use of
+    the workspace path escaped -- makedirs, the env file carrying
+    AWS_SECRET_ACCESS_KEY, the buildspec, the zip extraction. Bounding only the
+    delete left all the writes outside.
+    """
+    for build_id in ("../escaped:abc", "/abs/path:x", "..:y", "a/b:c"):
+        seg = codebuild._workspace_dirname(build_id)
+        assert "/" not in seg and not seg.startswith(".")
+    # and the ordinary case is unchanged
+    assert codebuild._workspace_dirname("demo:0001") == "demo_0001"
+
+
+def test_reap_workspace_keeps_artifacts_when_the_project_declares_them(tmp_path, monkeypatch):
+    """An S3-artifacts project keeps its output; only src/ and env/ go."""
+    monkeypatch.setattr(codebuild, "WORKSPACE", str(tmp_path))
+    monkeypatch.delenv("CODEBUILD_KEEP_WORKSPACE", raising=False)
+    workdir = tmp_path / "demo_0002"
+    for sub in ("src", "artifacts", "env"):
+        (workdir / sub).mkdir(parents=True)
+    (workdir / "artifacts" / "out.zip").write_text("x")
+
+    codebuild._reap_workspace(str(workdir), "demo:0002", keep_artifacts=True)
+
+    assert (workdir / "artifacts" / "out.zip").exists()
+    assert not (workdir / "src").exists()
 
 
 def test_execute_build_keeps_its_workspace_when_asked(monkeypatch, tmp_path):
