@@ -6858,6 +6858,53 @@ def _ec2_igw_delete(physical_id, props):
     _ec2._internet_gateways.pop(physical_id, None)
 
 
+def _ec2_tgw_attachment_create(logical_id, props, stack_name):
+    """Provision an AWS::EC2::TransitGatewayAttachment.
+
+    The transit gateway is NOT ours to create. A regional network stack points
+    the attachment at a literal `tgw-...` id belonging to a shared networking
+    account, so there is nothing here to attach to and nothing that could route
+    through it if there were. What matters is that the resource DEPLOYS: a route
+    in the same stack depends on it, so without a provisioner the whole regional
+    network stack rolls back on `Unsupported resource type` and takes the
+    environment with it. Only the environments with a real network declare one,
+    which is why this is invisible until the first one that does.
+
+    The attachment is recorded rather than discarded so
+    DescribeTransitGatewayVpcAttachments can find it; an inert resource is still
+    a resource that should be visible where AWS would show it.
+    """
+    import random
+    import string
+    att_id = "tgw-attach-" + "".join(random.choices(string.hexdigits[:16], k=17)).lower()
+    subnets = [sid for sid in (props.get("SubnetIds") or []) if isinstance(sid, str)]
+    _ec2._tgw_vpc_attachments[att_id] = {
+        "TransitGatewayAttachmentId": att_id,
+        "TransitGatewayId": props.get("TransitGatewayId", ""),
+        "VpcId": props.get("VpcId", ""),
+        # The account the STACK is in. AWS reports the VPC's owner, and the VPC
+        # is the one this stack just created, so they are the same account here.
+        "VpcOwnerId": get_account_id(),
+        "SubnetIds": subnets,
+        # `available`, not `pending`: nothing will ever move it on. Anything
+        # waiting for the attachment to settle would wait forever otherwise.
+        "State": "available",
+        "CreationTime": _ec2._now_ts(),
+    }
+    tags = [
+        {"Key": tag.get("Key", ""), "Value": tag.get("Value", "")}
+        for tag in props.get("Tags", [])
+    ]
+    if tags:
+        _ec2._tags[att_id] = tags
+    return att_id, {"Id": att_id}
+
+
+def _ec2_tgw_attachment_delete(physical_id, props):
+    _ec2._tgw_vpc_attachments.pop(physical_id, None)
+    _ec2._tags.pop(physical_id, None)
+
+
 def _ec2_vpc_gw_attach_create(logical_id, props, stack_name):
     vpc_id = props.get("VpcId", "")
     igw_id = props.get("InternetGatewayId", "")
@@ -10940,6 +10987,8 @@ _RESOURCE_HANDLERS = {
     "AWS::EC2::Subnet": {"create": _ec2_subnet_create, "delete": _ec2_subnet_delete},
     "AWS::EC2::SecurityGroup": {"create": _ec2_sg_create, "delete": _ec2_sg_delete},
     "AWS::EC2::InternetGateway": {"create": _ec2_igw_create, "delete": _ec2_igw_delete},
+    "AWS::EC2::TransitGatewayAttachment": {
+        "create": _ec2_tgw_attachment_create, "delete": _ec2_tgw_attachment_delete},
     "AWS::EC2::VPCGatewayAttachment": {"create": _ec2_vpc_gw_attach_create, "delete": _ec2_vpc_gw_attach_delete},
     "AWS::EC2::RouteTable": {"create": _ec2_rtb_create, "delete": _ec2_rtb_delete},
     "AWS::EC2::Route": {"create": _ec2_route_create, "delete": _ec2_route_delete},
