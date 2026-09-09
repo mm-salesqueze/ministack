@@ -117,6 +117,7 @@ _snapshots = AccountRegionScopedDict()       # snap_id -> snapshot record
 _nat_gateways = AccountRegionScopedDict()    # nat_id -> NAT gateway record
 _network_acls = AccountRegionScopedDict()    # acl_id -> network ACL record
 _flow_logs = AccountRegionScopedDict()       # flow_log_id -> flow log record
+_tgw_vpc_attachments = AccountRegionScopedDict()  # tgw-attach-id -> VPC attachment record
 _vpc_peering = AccountRegionScopedDict()     # pcx_id -> peering connection record
 _dhcp_options = AccountRegionScopedDict()    # dopt_id -> DHCP options record
 _egress_igws = AccountRegionScopedDict()     # eigw_id -> egress-only internet gateway record
@@ -249,6 +250,7 @@ def _clear_state():
     _nat_gateways.clear()
     _network_acls.clear()
     _flow_logs.clear()
+    _tgw_vpc_attachments.clear()
     _vpc_peering.clear()
     _dhcp_options.clear()
     _egress_igws.clear()
@@ -5072,6 +5074,43 @@ def _delete_flow_logs(params):
     return _xml(200, "DeleteFlowLogsResponse", "<unsuccessful/>")
 
 
+def _describe_transit_gateway_vpc_attachments(params):
+    """Describe the VPC attachments CloudFormation created.
+
+    There is no CreateTransitGatewayVpcAttachment here to match it: the transit
+    gateway itself belongs to another account and is referenced by a literal id,
+    so nothing local can create one and an attachment is inert either way. This
+    exists so a CFN-created attachment is not INVISIBLE -- a resource that
+    deploys and then cannot be found reads as a broken deploy.
+    """
+    ids = _parse_member_list(params, "TransitGatewayAttachmentIds")
+    filters = _parse_filters(params)
+    items = ""
+    for att in _tgw_vpc_attachments.values():
+        aid = att["TransitGatewayAttachmentId"]
+        if ids and aid not in ids:
+            continue
+        if not _resource_matches_tag_filters(aid, filters):
+            continue
+        if filters.get("transit-gateway-id") and att["TransitGatewayId"] not in filters["transit-gateway-id"]:
+            continue
+        if filters.get("vpc-id") and att["VpcId"] not in filters["vpc-id"]:
+            continue
+        subnets = "".join(f"<item>{sid}</item>" for sid in att["SubnetIds"])
+        items += f"""<item>
+            <transitGatewayAttachmentId>{aid}</transitGatewayAttachmentId>
+            <transitGatewayId>{att['TransitGatewayId']}</transitGatewayId>
+            <vpcId>{att['VpcId']}</vpcId>
+            <vpcOwnerId>{att['VpcOwnerId']}</vpcOwnerId>
+            <state>{att['State']}</state>
+            <subnetIds>{subnets}</subnetIds>
+            <creationTime>{att['CreationTime']}</creationTime>
+            {_tag_set_xml(aid)}
+        </item>"""
+    return _xml(200, "DescribeTransitGatewayVpcAttachmentsResponse",
+                f"<transitGatewayVpcAttachments>{items}</transitGatewayVpcAttachments>")
+
+
 # ---------------------------------------------------------------------------
 # VPC Peering Connections
 # ---------------------------------------------------------------------------
@@ -7285,6 +7324,7 @@ _ACTION_MAP = {
     "CreateFlowLogs": _create_flow_logs,
     "DescribeFlowLogs": _describe_flow_logs,
     "DeleteFlowLogs": _delete_flow_logs,
+    "DescribeTransitGatewayVpcAttachments": _describe_transit_gateway_vpc_attachments,
     # VPC Peering
     "CreateVpcPeeringConnection": _create_vpc_peering_connection,
     "AcceptVpcPeeringConnection": _accept_vpc_peering_connection,

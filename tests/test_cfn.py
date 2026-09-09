@@ -5689,6 +5689,69 @@ def test_cfn_ec2_vpc_endpoint_uses_ec2_state(cfn, ec2):
     )["VpcEndpoints"] == []
 
 
+def test_cfn_ec2_transit_gateway_attachment_is_visible_and_deletable(cfn, ec2):
+    """A TGW attachment deploys, is findable, and goes away with its stack.
+
+    The transit gateway id is a literal because that is the real shape: the
+    gateway lives in another account, so nothing in the stack creates it.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-tgwattach-{suffix}"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Vpc": {
+                "Type": "AWS::EC2::VPC",
+                "Properties": {"CidrBlock": "10.41.0.0/16"},
+            },
+            "Subnet": {
+                "Type": "AWS::EC2::Subnet",
+                "Properties": {"VpcId": {"Ref": "Vpc"}, "CidrBlock": "10.41.1.0/24"},
+            },
+            "Attachment": {
+                "Type": "AWS::EC2::TransitGatewayAttachment",
+                "Properties": {
+                    "TransitGatewayId": "tgw-0a1a9925f9981a600",
+                    "VpcId": {"Ref": "Vpc"},
+                    "SubnetIds": [{"Ref": "Subnet"}],
+                    "Tags": [{"Key": "source", "Value": "cloudformation"}],
+                },
+            },
+        },
+        "Outputs": {
+            "RefId": {"Value": {"Ref": "Attachment"}},
+            "GetAttId": {"Value": {"Fn::GetAtt": ["Attachment", "Id"]}},
+            "SubnetId": {"Value": {"Ref": "Subnet"}},
+        },
+    }
+
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, stack_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    outputs = {item["OutputKey"]: item["OutputValue"] for item in stack["Outputs"]}
+    assert outputs["RefId"] == outputs["GetAttId"]
+    assert outputs["RefId"].startswith("tgw-attach-")
+
+    found = ec2.describe_transit_gateway_vpc_attachments(
+        TransitGatewayAttachmentIds=[outputs["RefId"]]
+    )["TransitGatewayVpcAttachments"]
+    assert len(found) == 1
+    att = found[0]
+    assert att["TransitGatewayId"] == "tgw-0a1a9925f9981a600"
+    # The SUBNET the stack made, resolved: a raw {"Ref": ...} stored verbatim
+    # would still deploy and still be wrong.
+    assert att["SubnetIds"] == [outputs["SubnetId"]]
+    # `available`, because nothing here will ever advance it from `pending`.
+    assert att["State"] == "available"
+    assert _template_tags(att["Tags"]) == [{"Key": "source", "Value": "cloudformation"}]
+
+    cfn.delete_stack(StackName=stack_name)
+    _wait_stack(cfn, stack_name)
+    assert ec2.describe_transit_gateway_vpc_attachments(
+        TransitGatewayAttachmentIds=[outputs["RefId"]]
+    )["TransitGatewayVpcAttachments"] == []
+
+
 def test_cfn_ec2_resources_use_caller_region_context():
     """EC2 CFN provisioners must write through the caller's region context."""
     import boto3
