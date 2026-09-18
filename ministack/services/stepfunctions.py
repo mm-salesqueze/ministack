@@ -3537,6 +3537,9 @@ _EC2_QUERY_LIST_NAMES = {
     "IpRanges": "IpRanges",
     "Ipv6Ranges": "Ipv6Ranges",
     "LaunchTemplateConfigs": "LaunchTemplateConfigs",
+    # Never singularised, in any of the four operations that take it
+    # (DescribeTransitGateway{,Vpc,Peering}Attachments and ...Connects).
+    "TransitGatewayAttachmentIds": "TransitGatewayAttachmentIds",
     "Overrides": "Overrides",
     "OwnerIds": "Owner",
     "Resources": "ResourceId",
